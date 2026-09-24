@@ -5,8 +5,8 @@
 #
 # Gebrauch (auf dem Proxmox-Host als root):
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
-#   VMID=200 CORES=4 RAM=4096 DISK=32 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
-#   bash fygoos.sh --vmid 200 --cores 4 --memory 4096 --disk 32 --storage local-lvm --bridge vmbr0 --image-url https://...
+#   VMID=200 CORES=4 RAM=8192 DISK=32 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
+#   bash fygoos.sh --vmid 200 --cores 4 --memory 8192 --disk 32 --storage local-lvm --bridge vmbr0 --nic e1000 --image-url https://...
 #   bash fygoos.sh --dry-run        # zeigt nur qm-Befehle, ändert nichts
 #   bash fygoos.sh --debug          # = bash -x, komplette Fehlermeldungskette + Log unter /tmp/fygoos-install-*.log
 #
@@ -26,10 +26,11 @@ set -euo pipefail
 VMID="${VMID:-}"                       # leer = nächste freie ID via pvesh get /cluster/nextid
 NAME="${NAME:-fygoos}"
 CORES="${CORES:-4}"
-RAM="${RAM:-4096}"                     # MB; Forum: <4096 wird eng (2 GB rebootet)
+RAM="${RAM:-8192}"                     # MB; Forum: 2 GB = Reboot-Loop, 4096 teils Hänger -> Default 8192
 DISK="${DISK:-32}"                     # GB, Zielgröße nach qm resize
 STORAGE="${STORAGE:-}"                 # leer = Auto-Erkennung (local-lvm > local-zfs > local > erstbeste)
 BRIDGE="${BRIDGE:-}"                   # leer = vmbr0 falls vorhanden, sonst erste vmbr*
+NIC="${NIC:-virtio}"                   # virtio (Default) oder e1000 (Fallback falls FygoOS kein Netz bekommt)
 # Default ist ein bewährtes Beispiel aus dem Forum-Thread (Post #10, justinclift).
 # URLs rotieren – IMMER prüfen und ggf. übersteuern mit:
 #   --image-url <URL>  oder  IMAGE_URL=<URL> bash fygoos.sh
@@ -68,6 +69,7 @@ while [ $# -gt 0 ]; do
     --disk) DISK="$2"; shift 2;;
     --storage) STORAGE="$2"; shift 2;;
     --bridge) BRIDGE="$2"; shift 2;;
+    --nic) NIC="$2"; shift 2;;
     --image-url) IMAGE_URL="$2"; shift 2;;
     --cpu) CPU_TYPE="$2"; shift 2;;
     --vga) VGA="$2"; shift 2;;
@@ -144,7 +146,9 @@ if [ -z "$BRIDGE" ]; then
   log "Bridge (auto): $BRIDGE"
 fi
 
-[ "$RAM" -ge 4096 ] 2>/dev/null || warn "RAM=$RAM MB – Forum: mit 2 GB rebootet FydeOS, nimm >= 4096."
+[ "$RAM" -ge 8192 ] 2>/dev/null || warn "RAM=$RAM MB – Forum: 2 GB = Reboot-Loop, 4096 teils Hänger, nimm >= 8192 (Default)."
+[ "$NIC" = "virtio" ] || [ "$NIC" = "e1000" ] || { echo "[XX] NIC muss 'virtio' oder 'e1000' sein (gewählt: $NIC)." >&2; exit 1; }
+[ "$NIC" = "virtio" ] || warn "NIC=$NIC – e1000 nur als Fallback falls virtio kein Netz bekommt (langsamer)."
 [ "$CORES" -ge 2 ] 2>/dev/null || warn "CORES=$CORES – nimm >= 2 (Default 4, Typ host)."
 [ "$DISK" -ge 20 ] 2>/dev/null || warn "DISK=$DISK GB – Image ist ~7 GB entpackt, nimm >= 20 (Default 32)."
 [ "$CPU_TYPE" = "host" ] || warn "CPU_TYPE=$CPU_TYPE – Forum empfiehlt 'host' gegen Boot-Hänger."
@@ -163,7 +167,7 @@ run qm create "$VMID" --name "$NAME" --ostype l26 \
   --cores "$CORES" --cpu "$CPU_TYPE" --memory "$RAM" --balloon 0 \
   --bios "$BIOS" --machine q35 \
   --scsihw virtio-scsi-pci \
-  --net0 "virtio,bridge=$BRIDGE" \
+  --net0 "$NIC,bridge=$BRIDGE" \
   --vga "$VGA" \
   --onboot 1 --agent enabled=0
 
@@ -302,10 +306,11 @@ echo "             Proxmox-WebUI -> VM $VMID -> Konsole. Erster Boot dauert Minu
 echo "  Starten  : qm start $VMID     Stoppen: qm stop $VMID     Konfig: qm config $VMID"
 echo "  Log      : $LOG"
 echo ""
-echo "  Falls schwarzer Bildschirm / Boot hängt (bekannt, siehe Forum):"
-echo "    1) CPU auf host stellen:  qm set $VMID --cpu host"
-echo "    2) Mehr RAM geben (>= 8192): qm set $VMID --memory 8192"
-echo "    3) Echte GPU per Passthrough + internes VGA aus: qm set $VMID --vga none"
+echo "  Falls schwarzer Bildschirm / Boot hängt / keine IP (bekannt, siehe Forum):"
+echo "    1) Konsole prüfen (noVNC): Bootlogo/Desktop = ok, nur warten (erster Boot lang)."
+echo "    2) Bei Hänger: qm shutdown $VMID && qm wait $VMID && qm set $VMID --memory 8192 && qm start $VMID"
+echo "    3) Kein Netz trotz Desktop: qm set $VMID --delete net0 && qm set $VMID --net0 e1000,bridge=$BRIDGE && qm start $VMID"
+echo "    4) Weiter schwarz: echte GPU per Passthrough (lspci | grep -i vga -> qm set $VMID --hostpci0 <PCI>,pcie=1) + qm set $VMID --vga none"
 echo "       (im Forum: RX550 erfolgreich, integriertes QEMU-VGA bleibt schwarz)"
 echo "  Deinstall: qm stop $VMID && qm destroy $VMID --purge"
 echo "═════════════════════════════════════════════════════"
