@@ -261,6 +261,25 @@ if [ "$START" = "1" ]; then
     run qm status "$VMID" 2>&1 | tee -a "$LOG"
     if qm status "$VMID" 2>/dev/null | grep -q "status: running"; then
       ok "VM läuft (qm status = running)."
+      # IP via ARP/Neightable ermitteln (FygoOS hat keinen qemu-guest-agent,
+      # daher DHCP-Lease aus der Host-Neightable der Bridge lesen)
+      VM_MAC="$(qm config "$VMID" | grep -oP '^net0:.*?virtio=\K[0-9a-f:]+' | head -n1 || true)"
+      if [ -n "${VM_MAC:-}" ]; then
+        log "Warte auf DHCP-Lease (ARP-Lookup MAC $VM_MAC, max. 90s) ..."
+        VM_IP=""
+        for i in $(seq 1 18); do
+          sleep 5
+          VM_IP="$(ip neigh show dev "$BRIDGE" 2>/dev/null | grep -i "$VM_MAC" | awk '{print $1}' | head -n1 || true)"
+          [ -n "$VM_IP" ] && break
+          # Ping-Flush erzwingt neue ARP-Einträge im Subnetz der Bridge
+          ping -c1 -W1 -I "$BRIDGE" 255.255.255.255 >/dev/null 2>&1 || true
+        done
+        if [ -n "${VM_IP:-}" ]; then
+          ok "VM-IP (via ARP auf $BRIDGE): $VM_IP"
+        else
+          warn "Keine IP via ARP gefunden (VM hat evtl. noch keine DHCP-Lease oder kein Netz). Konsole nutzen: Proxmox-WebUI -> VM $VMID -> Konsole. Dort:Strg+Alt+F2 -> Shell -> 'ifconfig eth0'."
+        fi
+      fi
     else
       warn "VM läuft (noch) nicht – Ausgabe oben + Log prüfen: $LOG"
     fi
@@ -277,8 +296,10 @@ echo ""
 echo "════════════════ FYGOOS VM ERSTELLT ════════════════"
 echo "  VM       : $VMID ($NAME) – $CORES vCPU ($CPU_TYPE) / $RAM MB / ${DISK}G"
 echo "  Storage  : $STORAGE (sata0, Boot order=sata0, BIOS=$BIOS, onboot=1)"
+echo "  IP       : ${VM_IP:-<noch keine – Konsole: Proxmox-WebUI -> VM $VMID -> noVNC>}"
+echo "  Zugriff  : KEINE Web-UI (FygoOS ist ein Desktop-OS!) – Zugriff über noVNC-Konsole"
+echo "             Proxmox-WebUI -> VM $VMID -> Konsole. Erster Boot dauert Minuten."
 echo "  Starten  : qm start $VMID     Stoppen: qm stop $VMID     Konfig: qm config $VMID"
-echo "  Konsole  : Proxmox-WebUI -> VM $VMID -> Konsole (noVNC). Erster Boot dauert Minuten."
 echo "  Log      : $LOG"
 echo ""
 echo "  Falls schwarzer Bildschirm / Boot hängt (bekannt, siehe Forum):"
