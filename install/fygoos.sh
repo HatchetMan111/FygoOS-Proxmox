@@ -6,7 +6,9 @@
 # Gebrauch (auf dem Proxmox-Host als root):
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
 #   VMID=200 CORES=4 RAM=8192 DISK=32 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
-#   bash fygoos.sh --vmid 200 --cores 4 --memory 8192 --disk 32 --storage local-lvm --bridge vmbr0 --nic e1000 --image-url https://...
+#   bash fygoos.sh --variant iris --vmid 200 --cores 4 --memory 8192 --disk 32 --storage local-lvm --bridge vmbr0 --nic e1000
+#   bash fygoos.sh --image-url https://.../eigenes.img.xz   # eigene URL schlägt --variant immer
+#   VARIANT=apu bash fygoos.sh                             # auto erkennt sonst per lscpu (AMD->apu, Intel->iris)
 #   bash fygoos.sh --dry-run        # zeigt nur qm-Befehle, ändert nichts
 #   bash fygoos.sh --debug          # = bash -x, komplette Fehlermeldungskette + Log unter /tmp/fygoos-install-*.log
 #
@@ -31,12 +33,18 @@ DISK="${DISK:-32}"                     # GB, Zielgröße nach qm resize
 STORAGE="${STORAGE:-}"                 # leer = Auto-Erkennung (local-lvm > local-zfs > local > erstbeste)
 BRIDGE="${BRIDGE:-}"                   # leer = vmbr0 falls vorhanden, sonst erste vmbr*
 NIC="${NIC:-virtio}"                   # virtio (Default) oder e1000 (Fallback falls FygoOS kein Netz bekommt)
-# Default ist ein bewährtes Beispiel aus dem Forum-Thread (Post #10, justinclift).
-# URLs rotieren – IMMER prüfen und ggf. übersteuern mit:
-#   --image-url <URL>  oder  IMAGE_URL=<URL> bash fygoos.sh
-# Aktuelle Images: https://fydeos.io/download/ bzw. https://fygonas.com/download
-# Varianten beachten (apu / intel-legacy / iris – passend zur Host-CPU wählen).
-IMAGE_URL="${IMAGE_URL:-https://download.fydeos.io/FydeOS_for_PC_apu_v18.0-SP1-io-stable.img.xz}"
+# Welche FydeOS-for-PC-Variante (Host-CPU/GPU passend wählen!):
+#   auto   = per lscpu erkennen (AMD -> apu, Intel -> iris), Fallback apu
+#   apu    = AMD-Grafik (doppelt: AMD- oder Intel-CPU ab ~2011 + AMD-GPU) – Direkt-Link v18
+#   iris   = Intel Modern (Intel Core 6.-14. Gen mit HD/UHD/Xe) – Direkt-Link v18
+#   legacy = Intel Legacy (Core 3.-5. Gen, supportet FydeOS nicht mehr) – KEIN Direkt-Link:
+#            Image (.img.xz, z. B. v19) manuell von https://fydeos.io/download/pc/intel-hd/
+#            laden und per --image-url / IMAGE_URL übergeben.
+# Eigene URL schlägt die Tabelle immer: --image-url <URL> oder IMAGE_URL=<URL>.
+# Aktuelle Releases (v20+) sind .bin.zip via Drive/iCloud (nicht direkt ladbar) –
+# dafür eine .bin.zip-URL übergeben (wird per unzip entpackt) oder v18-.img.xz nehmen.
+VARIANT="${VARIANT:-auto}"
+IMAGE_URL="${IMAGE_URL:-}"
 CPU_TYPE="${CPU_TYPE:-host}"           # Forum: "host" löst viele Boot-Hänger
 BIOS="${BIOS:-ovmf}"                   # UEFI; SeaBIOS bootet das GPT-Image meist gar nicht
 VGA="${VGA:-std}"                      # Falls schwarz: hinterher "qm set VMID --vga none" + GPU-Passthrough
@@ -70,6 +78,7 @@ while [ $# -gt 0 ]; do
     --storage) STORAGE="$2"; shift 2;;
     --bridge) BRIDGE="$2"; shift 2;;
     --nic) NIC="$2"; shift 2;;
+    --variant) VARIANT="$2"; shift 2;;
     --image-url) IMAGE_URL="$2"; shift 2;;
     --cpu) CPU_TYPE="$2"; shift 2;;
     --vga) VGA="$2"; shift 2;;
@@ -154,6 +163,46 @@ fi
 [ "$CPU_TYPE" = "host" ] || warn "CPU_TYPE=$CPU_TYPE – Forum empfiehlt 'host' gegen Boot-Hänger."
 [ "$BIOS" = "ovmf" ] || warn "BIOS=$BIOS – Forum/Tests: SeaBIOS bootet das Image meist nicht, nimm ovmf."
 
+# ---------- Variante auflösen (VOR qm create, damit eine falsche URL keine VM-Leiche hinterlässt) ----------
+URL_APU="https://download.fydeos.io/FydeOS_for_PC_apu_v18.0-SP1-io-stable.img.xz"
+URL_IRIS="https://download.fydeos.io/FydeOS_for_PC_iris_v18.0-SP1-io-stable.img.xz"
+if [ "$VARIANT" = "auto" ]; then
+  if command -v lscpu >/dev/null 2>&1 && lscpu 2>/dev/null | grep -qi "AuthenticAMD"; then
+    VARIANT="apu"; log "CPU-Erkennung: AMD -> Variante apu"
+  elif command -v lscpu >/dev/null 2>&1 && lscpu 2>/dev/null | grep -qi "GenuineIntel"; then
+    VARIANT="iris"; log "CPU-Erkennung: Intel -> Variante iris (Core 6.-14. Gen). Bei Core 3.-5. Gen: --variant legacy + IMAGE_URL von https://fydeos.io/download/pc/intel-hd/"
+  else
+    VARIANT="apu"; warn "CPU-Hersteller nicht erkennbar (lscpu?) – nehme apu (Forum-bewährt). Per --variant iris|apu|legacy übersteuerbar."
+  fi
+fi
+if [ -z "${IMAGE_URL:-}" ]; then
+  case "$VARIANT" in
+    apu) IMAGE_URL="$URL_APU";;
+    iris) IMAGE_URL="$URL_IRIS";;
+    legacy|slim) echo "[XX] Variante '$VARIANT' hat keinen Direkt-Link (FydeOS liefert v20+ nur via Drive/iCloud). Image manuell von https://fydeos.io/download/ laden und per --image-url <URL> übergeben." >&2; exit 1;;
+    *) echo "[XX] Unbekannte Variante: $VARIANT (erlaubt: auto, apu, iris, legacy + --image-url)." >&2; exit 1;;
+  esac
+  log "Variante $VARIANT -> $IMAGE_URL"
+else
+  log "IMAGE_URL manuell gesetzt (schlägt Variante $VARIANT): $IMAGE_URL"
+fi
+case "$IMAGE_URL" in
+  *.zip) command -v unzip >/dev/null || { echo "[XX] 'unzip' erforderlich für .bin.zip-Images (apt install unzip)." >&2; exit 1; };;
+esac
+# Preflight: URL erreichbar? (Range-Request, lädt nur 1 KB – fängt 404/typo bevor eine VM angelegt wird)
+log "Prüfe Image-URL (Preflight) ..."
+if [ "$DRY_RUN" = "1" ]; then
+  echo "[DRY] curl -fsSL --max-time 30 -r 0-1023 -o /dev/null $IMAGE_URL"
+else
+  if command -v curl >/dev/null && curl -fsSL --max-time 30 -r 0-1023 -o /dev/null "$IMAGE_URL" 2>>"$LOG"; then
+    ok "Image-URL erreichbar."
+  else
+    echo "[XX] Image-URL nicht ladbar: $IMAGE_URL" | tee -a "$LOG" >&2
+    echo "[XX] Falsche Variante? Aktuell: $VARIANT. Versuche VARIANT=apu|iris oder eine eigene URL von https://fydeos.io/download/ per --image-url." | tee -a "$LOG" >&2
+    exit 1
+  fi
+fi
+
 run() {
   if [ "$DRY_RUN" = "1" ]; then echo "[DRY] $*"; else echo "[+] $*" >>"$LOG"; "$@"; fi
 }
@@ -182,15 +231,47 @@ mkdir -p "$TMPDIR_WORK"
 IMG_BASENAME="$(basename "$IMAGE_URL")"
 [ -n "$IMG_BASENAME" ] || { echo "[XX] IMAGE_URL hat keinen Dateinamen: $IMAGE_URL" >&2; exit 1; }
 XZ_FILE="$TMPDIR_WORK/$IMG_BASENAME"
+ZIP_FILE=""
 RAW_FILE="${XZ_FILE%.xz}"
 case "$IMG_BASENAME" in
   *.img.xz) RAW_FILE="${XZ_FILE%.xz}";;
-  *.img|*.raw) RAW_FILE="$XZ_FILE"; XZ_FILE="";;
-  *.ova) echo "[XX] .ova ist das VMware-Image (nur für VMware supportet, bootet unter KVM meist nicht: 'No bootable device'). Nimm ein FydeOS-for-PC .img.xz (siehe --image-url)." >&2; exit 1;;
-  *) warn "Unerwartete Endung ($IMG_BASENAME) – erwarte .img.xz. Versuche es trotzdem."; RAW_FILE="$TMPDIR_WORK/image.img";;
+  *.bin.zip) ZIP_FILE="$XZ_FILE"; XZ_FILE=""; RAW_FILE="$TMPDIR_WORK/${IMG_BASENAME%.zip}";;
+  *.zip) ZIP_FILE="$XZ_FILE"; XZ_FILE=""; RAW_FILE="$TMPDIR_WORK/${IMG_BASENAME%.zip}.bin";;
+  *.img|*.raw|*.bin) RAW_FILE="$XZ_FILE"; XZ_FILE="";;
+  *.ova) echo "[XX] .ova ist das VMware-Image (nur für VMware supportet, bootet unter KVM meist nicht: 'No bootable device'). Nimm FydeOS-for-PC (VARIANT=apu|iris, siehe --variant)." >&2; exit 1;;
+  *) warn "Unerwartete Endung ($IMG_BASENAME) – erwarte .img.xz oder .bin.zip. Versuche es trotzdem."; RAW_FILE="$TMPDIR_WORK/image.img";;
 esac
 
-if [ -n "${XZ_FILE:-}" ]; then
+if [ -n "${ZIP_FILE:-}" ]; then
+  # v20+: .bin.zip (aktuell nur via Drive/iCloud Mirrors – URL hierher übergeben)
+  if [ ! -s "$ZIP_FILE" ]; then
+    log "Lade Image-ZIP (kann >2 GB sein, dauert) ..."
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "[DRY] curl -fSL --retry 3 -o $ZIP_FILE $IMAGE_URL"
+    elif command -v curl >/dev/null; then
+      curl -fSL --retry 3 --retry-delay 5 -o "$ZIP_FILE" "$IMAGE_URL" 2>&1 | tee -a "$LOG"
+    else
+      wget -O "$ZIP_FILE" "$IMAGE_URL" 2>&1 | tee -a "$LOG"
+    fi
+  else
+    ok "Image-ZIP bereits vorhanden: $ZIP_FILE"
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[DRY] unzip -o $ZIP_FILE -d $TMPDIR_WORK  # .bin -> $RAW_FILE"
+  else
+    if [ ! -s "$RAW_FILE" ]; then
+      log "Entpacke ZIP ($ZIP_FILE, dauert) ..."
+      unzip -o "$ZIP_FILE" -d "$TMPDIR_WORK" 2>&1 | tee -a "$LOG"
+      FOUND_BIN="$(find "$TMPDIR_WORK" -maxdepth 1 -name '*.bin' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2- || true)"
+      [ -n "${FOUND_BIN:-}" ] || { echo "[XX] Kein .bin im ZIP gefunden (unzip -l $ZIP_FILE prüfen)." >&2; exit 1; }
+      [ "$FOUND_BIN" = "$RAW_FILE" ] || mv "$FOUND_BIN" "$RAW_FILE"
+    else
+      ok "Entpacktes Image vorhanden: $RAW_FILE"
+    fi
+    log "Image-Typ: $(file -b "$RAW_FILE" 2>/dev/null || echo unbekannt)"
+    sha256sum "$RAW_FILE" 2>/dev/null | tee -a "$LOG" || true
+  fi
+elif [ -n "${XZ_FILE:-}" ]; then
   if [ ! -s "$XZ_FILE" ]; then
     log "Lade Image (kann >1,5 GB sein, dauert je nach Leitung) ..."
     if [ "$DRY_RUN" = "1" ]; then
@@ -307,10 +388,12 @@ echo "  Starten  : qm start $VMID     Stoppen: qm stop $VMID     Konfig: qm conf
 echo "  Log      : $LOG"
 echo ""
 echo "  Falls schwarzer Bildschirm / Boot hängt / keine IP (bekannt, siehe Forum):"
-echo "    1) Konsole prüfen (noVNC): Bootlogo/Desktop = ok, nur warten (erster Boot lang)."
-echo "    2) Bei Hänger: qm shutdown $VMID && qm wait $VMID && qm set $VMID --memory 8192 && qm start $VMID"
-echo "    3) Kein Netz trotz Desktop: qm set $VMID --delete net0 && qm set $VMID --net0 e1000,bridge=$BRIDGE && qm start $VMID"
-echo "    4) Weiter schwarz: echte GPU per Passthrough (lspci | grep -i vga -> qm set $VMID --hostpci0 <PCI>,pcie=1) + qm set $VMID --vga none"
+echo "    1) Falsche Variante? Script erkennt per lscpu (AMD->apu, Intel->iris). Prüfen: lscpu | grep -i 'model name'."
+echo "       Andere Variante erzwingen: VARIANT=apu|iris bash fygoos.sh  (Core 3.-5. Gen braucht --variant legacy + IMAGE_URL von fydeos.io/download/pc/intel-hd/)"
+echo "    2) Konsole prüfen (noVNC): Bootlogo/Desktop = ok, nur warten (erster Boot lang)."
+echo "    3) Bei Hänger: qm shutdown $VMID && qm wait $VMID && qm start $VMID (RAM ist schon 8192)."
+echo "    4) Kein Netz trotz Desktop: qm set $VMID --delete net0 && qm set $VMID --net0 e1000,bridge=$BRIDGE && qm start $VMID"
+echo "    5) Weiter schwarz: echte GPU per Passthrough (lspci | grep -i vga -> qm set $VMID --hostpci0 <PCI>,pcie=1) + qm set $VMID --vga none"
 echo "       (im Forum: RX550 erfolgreich, integriertes QEMU-VGA bleibt schwarz)"
 echo "  Deinstall: qm stop $VMID && qm destroy $VMID --purge"
 echo "═════════════════════════════════════════════════════"

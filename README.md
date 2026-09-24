@@ -24,7 +24,8 @@ bash fygoos.sh --no-start  # nur anlegen, nicht starten
 |---|---|
 | VM-Name | `fygoos` |
 | Zweck | FygoOS/FydeOS als Desktop-VM (ChromeOS-artig, inkl. Android-/Linux-Support) |
-| Image | FydeOS-for-PC `.img.xz` (Variante passend zur Host-CPU: apu / intel / iris – **kein** `.ova`, das ist nur für VMware und bootet unter KVM meist nicht) |
+| Image | FydeOS-for-PC, per `VARIANT` gewählt: `auto` (Default, `lscpu`: AMD→`apu`, Intel→`iris`), `apu` (AMD-Grafik), `iris` (Intel 6.-14. Gen), `legacy` (nur mit eigener `--image-url`) – eigene URL schlägt die Variante immer |
+| Image-Format | v18 `.img.xz` (Direkt-Link, `xz -d`) oder v20+ `.bin.zip` (per `unzip`, z. B. eigene URL) – **kein** `.ova` (nur VMware, bootet unter KVM meist nicht) |
 | Standard-Ressourcen | 4 vCPU (Typ `host`) / 8192 MB RAM / 32 GB Disk (RAM bewusst hoch: 2 GB = Reboot-Loop, 4096 teils Hänger) |
 | NIC | `virtio` (Default), Fallback `--nic e1000` falls die VM kein Netz bekommt |
 | VMID | immer die **nächste freie ID** (`pvesh get /cluster/nextid`), außer `--vmid` gesetzt |
