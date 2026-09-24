@@ -33,9 +33,20 @@ bash fygoos.sh --no-start  # nur anlegen, nicht starten
 
 Das Skript (`set -euo pipefail`, `trap ERR` mit Befehl+Zeile+Exit-Code):
 1. prüft root/`qm`/`pvesh`/`pvesm`/`xz`, nimmt die nächste freie VMID, erkennt Storage (`local-lvm` > `local-zfs` > `local`) und Bridge (`vmbr0`),
-2. erstellt die VM (`ostype l26`, `cpu host`, UEFI, VirtIO-Net, `vga std`, Guest-Agent aus),
-3. lädt das `.img.xz` nach `/var/tmp/fygoos-install`, prüft mit `xz -t`, entpackt, importiert per `qm disk import` und hängt als `sata0` mit `boot order=sata0` ein,
-4. verifiziert `qm config` (sata0 + onboot) und `qm status` (running) und gibt Start-/Stopp-/Konsolen-Hinweise aus.
+2. löst die Variante auf (`auto` per `lscpu`: AMD→`apu`, Intel→`iris`; eigene `--image-url` gewinnt immer) und prüft die URL per Preflight **vor** `qm create`,
+3. erstellt die VM (`ostype l26`, `cpu host`, UEFI+efidisk, VirtIO-Net, `vga std`, Guest-Agent aus, `onboot: 1`),
+4. lädt das Image (`.img.xz` per `xz -d`, `.bin.zip` per `unzip`), importiert per `qm disk import`, hängt als `sata0` mit `boot order=sata0` ein, erweitert auf Zielgröße,
+5. **GRUB-Tweak** (Default an, `--no-grub-tweak` zum Abschalten): mappt die ESP per `kpartx`, sichert `grub.cfg` nach `grub.cfg.orig` und ersetzt `i915.modeset=1` durch `i915.modeset=0 nomodeset` (QEMU hat keine Intel-GPU; dm-verity bleibt unangetastet) – best-effort, bricht die Installation bei Fehlern nicht ab,
+6. verifiziert `qm config` (sata0 + onboot) und `qm status` (running), sucht bis 90 s per ARP die DHCP-IP und gibt alles aus.
+
+## Von vorne (alte VM weg, neu mit 126er-Erkenntnissen)
+
+```bash
+qm stop 126 && qm destroy 126 --purge
+VARIANT=apu NIC=e1000 VGA=virtio bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
+# Varianten: auto (Default) | apu | iris | legacy (legacy nur mit --image-url)
+# GRUB-Tweak abschalten: GRUB_TWEAK=0 ...  bzw.  bash fygoos.sh --no-grub-tweak
+```
 
 Erwartete Schlussausgabe (Beispiel):
 

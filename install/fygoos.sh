@@ -11,6 +11,8 @@
 #   VARIANT=apu bash fygoos.sh                             # auto erkennt sonst per lscpu (AMD->apu, Intel->iris)
 #   bash fygoos.sh --dry-run        # zeigt nur qm-Befehle, ändert nichts
 #   bash fygoos.sh --debug          # = bash -x, komplette Fehlermeldungskette + Log unter /tmp/fygoos-install-*.log
+#   bash fygoos.sh --manual         # = --no-start: nur VM hinstellen, Start + Konsole manuell
+#   bash fygoos.sh --no-grub-tweak  # ESP/grub.cfg unverändert lassen (Default: nomodeset-Tweak aktiv)
 #
 # Warum VM statt LXC: FygoOS ist ein vollständiges ChromeOS-artiges Desktop-OS
 # (eigener Kernel, Android-/Linux-Container). Das läuft nicht in einem LXC.
@@ -48,6 +50,7 @@ IMAGE_URL="${IMAGE_URL:-}"
 CPU_TYPE="${CPU_TYPE:-host}"           # Forum: "host" löst viele Boot-Hänger
 BIOS="${BIOS:-ovmf}"                   # UEFI; SeaBIOS bootet das GPT-Image meist gar nicht
 VGA="${VGA:-std}"                      # Falls schwarz: hinterher "qm set VMID --vga none" + GPU-Passthrough
+GRUB_TWEAK="${GRUB_TWEAK:-1}"          # 1 = i915.modeset=1 -> "i915.modeset=0 nomodeset" in ESP/grub.cfg (QEMU hat keine Intel-GPU; dm-verity bleibt unangetastet). 0 = ESP unverändert lassen.
 START="${START:-1}"                    # 1 = VM nach Erstellung starten, 0 = nur anlegen
 DRY_RUN="${DRY_RUN:-0}"                # 1 = nur Befehle zeigen
 LOG="/tmp/fygoos-install-$(date +%Y%m%d-%H%M%S).log"
@@ -82,6 +85,8 @@ while [ $# -gt 0 ]; do
     --image-url) IMAGE_URL="$2"; shift 2;;
     --cpu) CPU_TYPE="$2"; shift 2;;
     --vga) VGA="$2"; shift 2;;
+    --grub-tweak) GRUB_TWEAK="1"; shift;;
+    --no-grub-tweak) GRUB_TWEAK="0"; shift;;
     --no-start|--manual) START="0"; shift;;   # nur VM hinstellen, Start + Konsole manuell (wie PBS --manual)
     --dry-run) DRY_RUN="1"; shift;;
     --debug) DEBUG="1"; set -x; shift;;
@@ -309,6 +314,7 @@ log "Importiere Disk nach $STORAGE (qm disk import, dauert) ..."
 if [ "$DRY_RUN" = "1" ]; then
   echo "[DRY] qm disk import $VMID $RAW_FILE $STORAGE"
   echo "[DRY] qm set $VMID --sata0 $STORAGE:vm-$VMID-disk-0 --boot order=sata0"
+  if [ "${GRUB_TWEAK:-1}" = "1" ]; then echo "[DRY] GRUB-Tweak: kpartx ESP mappen, grub.cfg sichern, s/i915.modeset=1/i915.modeset=0 nomodeset/"; else echo "[DRY] GRUB-Tweak deaktiviert"; fi
 else
   run qm disk import "$VMID" "$RAW_FILE" "$STORAGE" 2>&1 | tee -a "$LOG"
   UNUSED="$(qm config "$VMID" | grep -oP '^unused0: \K[^,]+' | head -n1 || true)"
@@ -319,6 +325,44 @@ else
   # Auf Zielgröße erweitern (Image selbst ist ~7 GB, thin)
   if [ "$DISK" -gt 8 ] 2>/dev/null; then
     run qm resize "$VMID" sata0 "${DISK}G" 2>&1 | tee -a "$LOG" || warn "qm resize fehlgeschlagen – VM nutzt Image-Größe, läuft trotzdem."
+  fi
+  # ---------- GRUB-Tweak auf der ESP (best-effort, bricht Install bei Fehler NICHT ab) ----------
+  # Befund: FydeOS-Kernel hängt mit i915.modeset=1 (keine Intel-GPU unter QEMU).
+  # Die ESP wird per kpartx gemappt, grub.cfg gesichert + gepatcht, alles wieder aufgeräumt.
+  if [ "${GRUB_TWEAK:-1}" != "1" ]; then
+    log "GRUB-Tweak deaktiviert (--no-grub-tweak) – ESP bleibt unverändert."
+  elif ! command -v kpartx >/dev/null; then
+    warn "kpartx fehlt (apt install multipath-tools) – GRUB-Tweak übersprungen."
+  else
+    DISK_DEV="$(pvesm path "$UNUSED" 2>/dev/null || true)"
+    if [ -z "${DISK_DEV:-}" ] || [ ! -e "$DISK_DEV" ]; then
+      warn "Backing-Device für $UNUSED nicht auflösbar – GRUB-Tweak übersprungen."
+    elif kpartx -av "$DISK_DEV" >>"$LOG" 2>&1; then
+      ESP_MAP="$(blkid 2>/dev/null | grep -i 'PARTLABEL="EFI-SYSTEM"' | cut -d: -f1 | head -n1 || true)"
+      if [ -z "${ESP_MAP:-}" ]; then
+        warn "EFI-SYSTEM-Partition nicht gefunden – GRUB-Tweak übersprungen."
+      else
+        MNT="$TMPDIR_WORK/esp"
+        mkdir -p "$MNT"
+        if mount -o rw "$ESP_MAP" "$MNT" 2>>"$LOG"; then
+          GRUBCFG="$(find "$MNT" -ipath '*efi/boot/grub.cfg' 2>/dev/null | head -n1 || true)"
+          if [ -n "${GRUBCFG:-}" ] && [ -f "$GRUBCFG" ]; then
+            cp "$GRUBCFG" "$GRUBCFG.orig"
+            sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$GRUBCFG"
+            NTWEAK="$(grep -c nomodeset "$GRUBCFG" || true)"
+            ok "GRUB-Tweak gesetzt: ${NTWEAK}x nomodeset in $(basename "$(dirname "$GRUBCFG")")/$(basename "$GRUBCFG") (Backup: grub.cfg.orig)."
+          else
+            warn "efi/boot/grub.cfg nicht auf ESP – Tweak übersprungen."
+          fi
+          umount "$MNT" 2>>"$LOG" || warn "umount $MNT fehlgeschlagen – bitte manuell: umount $MNT"
+        else
+          warn "ESP-Mount fehlgeschlagen – Tweak übersprungen."
+        fi
+      fi
+      kpartx -d "$DISK_DEV" >>"$LOG" 2>&1 || warn "kpartx -d $DISK_DEV fehlgeschlagen – bitte manuell aufräumen."
+    else
+      warn "kpartx -av $DISK_DEV fehlgeschlagen – Tweak übersprungen."
+    fi
   fi
 fi
 
@@ -385,6 +429,7 @@ echo "  IP       : ${VM_IP:-<noch keine – Konsole: Proxmox-WebUI -> VM $VMID -
 echo "  Zugriff  : KEINE Web-UI (FygoOS ist ein Desktop-OS!) – Zugriff über noVNC-Konsole"
 echo "             Proxmox-WebUI -> VM $VMID -> Konsole. Erster Boot dauert Minuten."
 echo "  Starten  : qm start $VMID     Stoppen: qm stop $VMID     Konfig: qm config $VMID"
+echo "  GRUB-Tweak: $([ "${GRUB_TWEAK:-1}" = "1" ] && echo "nomodeset aktiv (ESP/grub.cfg + .orig-Backup)" || echo "aus (--no-grub-tweak)")"
 echo "  Log      : $LOG"
 echo ""
 echo "  Falls schwarzer Bildschirm / Boot hängt / keine IP (bekannt, siehe Forum):"
