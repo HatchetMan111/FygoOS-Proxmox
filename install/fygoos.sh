@@ -82,7 +82,7 @@ while [ $# -gt 0 ]; do
     --image-url) IMAGE_URL="$2"; shift 2;;
     --cpu) CPU_TYPE="$2"; shift 2;;
     --vga) VGA="$2"; shift 2;;
-    --no-start) START="0"; shift;;
+    --no-start|--manual) START="0"; shift;;   # nur VM hinstellen, Start + Konsole manuell (wie PBS --manual)
     --dry-run) DRY_RUN="1"; shift;;
     --debug) DEBUG="1"; set -x; shift;;
     -h|--help) usage; exit 0;;
