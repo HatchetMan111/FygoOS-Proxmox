@@ -13,6 +13,12 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Pr
 Anpassungen (VMID immer **nächste freie**, außer gesetzt):
 
 ```bash
+bash fygoos.sh --yes   # keine Rückfragen (unattended, Defaults/ENV/Flags)
+```
+
+Ohne `--yes` fragt das Script am Terminal alles ab (Community-Scripts-Stil, Enter = Default): VMID, Name, vCPU, **RAM**, **Disk**, Storage, Bridge, Variante, NIC — vorher zeigt es die **Thin-Pool-Füllstände** (`Data% über ~85% = kritisch`, Lehre aus einem vollgelaufenen `pve/data`) und den Bedarf (`${DISK} GB Thin-Volume + ~8 GB Download-Cache). Mit `n` bei „Installieren?" brichst du ohne Änderung ab. Ohne TTY (z. B. Curie-Pipe) läuft es automatisch mit Defaults weiter.
+
+```bash
 VMID=200 CORES=4 RAM=8192 DISK=64 IMAGE_URL=https://download.fydeos.io/<aktuelles>-img.xz bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
 bash fygoos.sh --vmid 200 --cores 4 --memory 8192 --disk 64 --storage local-lvm --bridge vmbr0 --image-url https://...
 bash fygoos.sh --dry-run   # ändert nichts, zeigt nur qm-Befehle

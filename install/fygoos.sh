@@ -10,6 +10,9 @@
 #   bash fygoos.sh --image-url https://.../eigenes.img.xz   # eigene URL schlägt --variant immer
 #   VARIANT=apu bash fygoos.sh                             # auto erkennt sonst per lscpu (AMD->apu, Intel->iris)
 #   bash fygoos.sh --dry-run        # zeigt nur qm-Befehle, ändert nichts
+#   bash fygoos.sh --yes            # keine Rückfragen (unattended, Defaults/ENV/Flags)
+#   Bei TTY fragt das Script sonst zu Beginn ab (VMID, Name, Kerne, RAM, Disk,
+#   Storage, Bridge, Variante, NIC – Community-Scripts-Stil, Enter = Default).
 #   bash fygoos.sh --debug          # = bash -x, komplette Fehlermeldungskette + Log unter /tmp/fygoos-install-*.log
 #   bash fygoos.sh --manual         # = --no-start: nur VM hinstellen, Start + Konsole manuell
 #   bash fygoos.sh --no-grub-tweak  # ESP/grub.cfg unverändert lassen (Default: nomodeset-Tweak aktiv)
@@ -53,6 +56,7 @@ VGA="${VGA:-std}"                      # Falls schwarz: hinterher "qm set VMID -
 GRUB_TWEAK="${GRUB_TWEAK:-1}"          # 1 = i915.modeset=1 -> "i915.modeset=0 nomodeset" in ESP/grub.cfg (QEMU hat keine Intel-GPU; dm-verity bleibt unangetastet). 0 = ESP unverändert lassen.
 START="${START:-1}"                    # 1 = VM nach Erstellung starten, 0 = nur anlegen
 DRY_RUN="${DRY_RUN:-0}"                # 1 = nur Befehle zeigen
+YES="${YES:-0}"                        # 1 = keine Rückfragen (unattended). Default: bei TTY interaktiv abfragen
 LOG="/tmp/fygoos-install-$(date +%Y%m%d-%H%M%S).log"
 TMPDIR_WORK="/var/tmp/fygoos-install"
 
@@ -89,6 +93,7 @@ while [ $# -gt 0 ]; do
     --no-grub-tweak) GRUB_TWEAK="0"; shift;;
     --no-start|--manual) START="0"; shift;;   # nur VM hinstellen, Start + Konsole manuell (wie PBS --manual)
     --dry-run) DRY_RUN="1"; shift;;
+    --yes|-y) YES="1"; shift;;
     --debug) DEBUG="1"; set -x; shift;;
     -h|--help) usage; exit 0;;
     *) echo "[XX] Unbekanntes Flag: $1 (siehe --help)" >&2; exit 2;;
@@ -104,7 +109,32 @@ command -v pvesm >/dev/null || { echo "[XX] 'pvesm' nicht gefunden." >&2; exit 1
 command -v curl >/dev/null || command -v wget >/dev/null || { echo "[XX] curl oder wget erforderlich." >&2; exit 1; }
 command -v xz >/dev/null || { echo "[XX] 'xz' erforderlich (apt install xz-utils)." >&2; exit 1; }
 
-# ---------- nächste freie VMID (immer, außer gesetzt) ----------
+# ---------- nächste freie VMID (Default; Kollision wird nach den Prompts geprüft) ----------
+ensure_vmid_free() {
+  if qm status "$VMID" >/dev/null 2>&1 || [ -e "/etc/pve/qemu-server/${VMID}.conf" ]; then
+    FREE_ID="$(pvesh get /cluster/nextid 2>>"$LOG" || true)"
+    if [ -n "${FREE_ID:-}" ] && [ "$FREE_ID" != "$VMID" ]; then
+      warn "VMID $VMID belegt – weiche auf freie ID $FREE_ID aus."
+      VMID="$FREE_ID"
+    else
+      for cand in $(seq 100 999); do
+        if ! qm status "$cand" >/dev/null 2>&1 && [ ! -e "/etc/pve/qemu-server/${cand}.conf" ]; then
+          warn "VMID $VMID belegt – weiche auf freie ID $cand aus (Scan)."
+          VMID="$cand"
+          break
+        fi
+      done
+    fi
+  fi
+  if qm status "$VMID" >/dev/null 2>&1 || [ -e "/etc/pve/qemu-server/${VMID}.conf" ]; then
+    echo "[XX] VMID $VMID ist belegt und keine freie ID gefunden – bitte --vmid <frei> setzen." >&2
+    exit 1
+  fi
+  if [ -e "/etc/pve/qemu-server/${VMID}.conf" ]; then
+    echo "[XX] /etc/pve/qemu-server/${VMID}.conf existiert bereits – breche ab (idempotent, nichts überschrieben)." >&2
+    exit 1
+  fi
+}
 if [ -z "$VMID" ]; then
   if VMID="$(pvesh get /cluster/nextid 2>>"$LOG")"; then
     log "VMID (nächste freie): $VMID"
@@ -118,22 +148,6 @@ if [ -z "$VMID" ]; then
     done
     [ -n "$VMID" ] || { echo "[XX] Keine freie VMID gefunden." >&2; exit 1; }
   fi
-else
-  if qm status "$VMID" >/dev/null 2>&1 || [ -e "/etc/pve/qemu-server/${VMID}.conf" ]; then
-    FREE_ID="$(pvesh get /cluster/nextid 2>>"$LOG" || true)"
-    if [ -n "${FREE_ID:-}" ]; then
-      warn "VMID $VMID belegt – weiche auf freie ID $FREE_ID aus."
-      VMID="$FREE_ID"
-    else
-      echo "[XX] VMID $VMID ist belegt. Freie ID wählen oder --vmid <frei> setzen." >&2
-      exit 1
-    fi
-  fi
-fi
-# Idempotenz: gleiche VM existiert bereits mit unserem Namen -> abbrechen statt doppelt anlegen
-if [ -e "/etc/pve/qemu-server/${VMID}.conf" ]; then
-  echo "[XX] /etc/pve/qemu-server/${VMID}.conf existiert bereits – breche ab (idempotent, nichts überschrieben)." >&2
-  exit 1
 fi
 
 # ---------- Storage Auto-Erkennung ----------
@@ -159,6 +173,46 @@ if [ -z "$BRIDGE" ]; then
   [ -n "${BRIDGE:-}" ] || { echo "[XX] Keine vmbr*-Bridge gefunden." >&2; exit 1; }
   log "Bridge (auto): $BRIDGE"
 fi
+
+# ---------- Interaktive Abfrage (Community-Scripts-Stil; --yes zum Überspringen) ----------
+ask() { # ask VAR "Fragetext" "Default" – Enter übernimmt Default
+  local __var="$1" __prompt="$2" __def="$3" __val
+  printf '%s [%s]: ' "$__prompt" "$__def"
+  read -r __val || __val=""
+  if [ -n "$__val" ]; then printf -v "$__var" '%s' "$__val"; else printf -v "$__var" '%s' "$__def"; fi
+}
+is_num() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+if [ "${YES:-0}" != "1" ] && [ -t 0 ]; then
+  echo ""
+  echo "════════ FygoOS VM – Setup (Enter = Default) ════════"
+  if command -v lvs >/dev/null 2>&1; then
+    echo "--- Thin-Pools (Data% über ~85% = kritisch, dann lieber NICHT installieren) ---"
+    lvs --noheadings -o lv_name,vg_name,data_percent 2>/dev/null | awk 'NF>=3 && $3 ~ /%/ {print "  Pool " $2 "/" $1 ": " $3}' | head -5
+    echo "  Bedarf: ${DISK} GB Thin-Volume auf $STORAGE plus ~8 GB Download-Cache in /var/tmp"
+  fi
+  _d="$VMID"; ask VMID "VMID (nächste freie)" "$VMID"
+  [ -n "$VMID" ] || { echo "[XX] VMID erforderlich (Zahl oder Abbruch mit Strg+C)." >&2; exit 1; }
+  is_num "$VMID" || { warn "Keine Zahl – nehme $_d."; VMID="$_d"; }
+  ensure_vmid_free
+  ask NAME "VM-Name" "$NAME"
+  _d="$CORES"; ask CORES "vCPU-Kerne (min. 2)" "$CORES"
+  is_num "$CORES" || { warn "Keine Zahl – nehme $_d."; CORES="$_d"; }
+  _d="$RAM"; ask RAM "RAM in MB (min. 8192, FydeOS-Reboot-Loop darunter)" "$RAM"
+  is_num "$RAM" || { warn "Keine Zahl – nehme $_d."; RAM="$_d"; }
+  _d="$DISK"; ask DISK "Disk in GB (min. 20, Thin-Pool beachten!)" "$DISK"
+  is_num "$DISK" || { warn "Keine Zahl – nehme $_d."; DISK="$_d"; }
+  ask STORAGE "Storage" "$STORAGE"
+  ask BRIDGE "Bridge" "$BRIDGE"
+  ask VARIANT "Variante (auto|apu|iris|legacy)" "$VARIANT"
+  ask NIC "NIC (virtio|e1000)" "$NIC"
+  echo ""
+  echo "  VM $VMID ($NAME): $CORES vCPU ($CPU_TYPE) / $RAM MB / ${DISK}G auf $STORAGE, Bridge $BRIDGE, Variante $VARIANT, NIC $NIC"
+  printf 'Installieren? [J/n]: '
+  read -r _go || _go=""
+  case "$_go" in n|N|nein|NEIN|no|NO) echo "Abgebrochen – nichts geändert."; exit 0;; esac
+  echo ""
+fi
+ensure_vmid_free
 
 [ "$RAM" -ge 8192 ] 2>/dev/null || warn "RAM=$RAM MB – Forum: 2 GB = Reboot-Loop, 4096 teils Hänger, nimm >= 8192 (Default)."
 [ "$NIC" = "virtio" ] || [ "$NIC" = "e1000" ] || { echo "[XX] NIC muss 'virtio' oder 'e1000' sein (gewählt: $NIC)." >&2; exit 1; }
