@@ -16,6 +16,7 @@
 #   Storage, Bridge, Variante, NIC – Community-Scripts-Stil, Enter = Default).
 #   bash fygoos.sh --debug          # = bash -x, komplette Fehlermeldungskette + Log unter /tmp/fygoos-install-*.log
 #   bash fygoos.sh --manual         # = --no-start: nur VM hinstellen, Start + Konsole manuell
+#   bash fygoos.sh --serial-console # Kernel-Log auf seriell (Debug per "qm terminal VMID")
 #   bash fygoos.sh --no-grub-tweak  # ESP/grub.cfg unverändert lassen (Default: nomodeset-Tweak aktiv)
 #
 # Warum VM statt LXC: FygoOS ist ein vollständiges ChromeOS-artiges Desktop-OS
@@ -56,6 +57,7 @@ BIOS="${BIOS:-ovmf}"                   # ovmf (UEFI, Standard) oder seabios (Exp
 BOOT_DISK="${BOOT_DISK:-sata}"         # sata (Forum-bewährt) | virtio | scsi – OVMF sieht nicht jeden Controller als Boot-Device
 VGA="${VGA:-std}"                      # Falls schwarz: hinterher "qm set VMID --vga none" + GPU-Passthrough
 GRUB_TWEAK="${GRUB_TWEAK:-1}"          # 1 = i915.modeset=1 -> "i915.modeset=0 nomodeset" in ESP/grub.cfg (QEMU hat keine Intel-GPU; dm-verity bleibt unangetastet). 0 = ESP unverändert lassen.
+SERIAL_CONSOLE="${SERIAL_CONSOLE:-0}"  # 1 = Kernel-Log auf serielle Konsole (syslinux: console=ttyS0,115200n8 + qm serial0) – Debug per "qm terminal VMID". Standard aus.
 START="${START:-1}"                    # 1 = VM nach Erstellung starten, 0 = nur anlegen
 DRY_RUN="${DRY_RUN:-0}"                # 1 = nur Befehle zeigen
 YES="${YES:-0}"                        # 1 = keine Rückfragen (unattended). Default: bei TTY interaktiv abfragen
@@ -95,6 +97,7 @@ while [ $# -gt 0 ]; do
     --vga) VGA="$2"; shift 2;;
     --grub-tweak) GRUB_TWEAK="1"; shift;;
     --no-grub-tweak) GRUB_TWEAK="0"; shift;;
+    --serial-console) SERIAL_CONSOLE="1"; shift;;
     --no-start|--manual) START="0"; shift;;   # nur VM hinstellen, Start + Konsole manuell (wie PBS --manual)
     --dry-run) DRY_RUN="1"; shift;;
     --yes|-y) YES="1"; shift;;
@@ -220,6 +223,8 @@ if [ "${YES:-0}" != "1" ] && [ -t 0 ]; then
   case "$BOOT_DISK" in sata|virtio|scsi) ;; *) warn "Unbekannt – nehme $_d."; BOOT_DISK="$_d";; esac
   _d="$BIOS"; ask BIOS "Firmware (ovmf|seabios)" "$BIOS"
   case "$BIOS" in ovmf|seabios) ;; *) warn "Unbekannt – nehme $_d."; BIOS="$_d";; esac
+  _d="$SERIAL_CONSOLE"; ask SERIAL_CONSOLE "Serielle Kernel-Konsole für Debug (0|1, lesen per: qm terminal VMID)" "$SERIAL_CONSOLE"
+  case "$SERIAL_CONSOLE" in 0|1) ;; *) warn "Unbekannt – nehme $_d."; SERIAL_CONSOLE="$_d";; esac
   echo ""
   echo "  VM $VMID ($NAME): $CORES vCPU ($CPU_TYPE) / $RAM MB / ${DISK}G auf $STORAGE, Bridge $BRIDGE, Variante $VARIANT, NIC $NIC, Boot $BOOT_DISK, FW $BIOS"
   printf 'Installieren? [J/n]: '
@@ -305,6 +310,15 @@ run qm create "$VMID" --name "$NAME" --ostype l26 \
 if [ "$BIOS" = "ovmf" ]; then
   run qm set "$VMID" --efidisk0 "${STORAGE}:1,efitype=4m,pre-enrolled-keys=1" 2>&1 | tee -a "$LOG" || \
     run qm set "$VMID" --efidisk0 "${STORAGE}:1" 2>&1 | tee -a "$LOG"
+fi
+
+# Serielle Konsole für Kernel-Log (nur mit --serial-console / SERIAL_CONSOLE=1)
+if [ "${SERIAL_CONSOLE:-0}" = "1" ]; then
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[DRY] qm set $VMID --serial0 socket  (Kernel-Log lesen: qm terminal $VMID)"
+  else
+    run qm set "$VMID" --serial0 socket 2>&1 | tee -a "$LOG" || warn "serial0 setzen fehlgeschlagen – Kernel-Log nur per noVNC lesbar."
+  fi
 fi
 
 # ---------- Image laden + entpacken ----------
@@ -453,6 +467,17 @@ else
               fi
             done
             ok "syslinux-Tweak: $NSYS cfg-Datei(en) mit nomodeset gepatcht (SeaBIOS-Boot)."
+            if [ "${SERIAL_CONSOLE:-0}" = "1" ]; then
+              NSER=0
+              for cfg in "$MNT"/syslinux/*.cfg "$MNT"/syslinux.cfg; do
+                [ -f "$cfg" ] || continue
+                if grep -qE '^[[:space:]]*append ' "$cfg" 2>/dev/null && ! grep -q "console=ttyS0" "$cfg" 2>/dev/null; then
+                  cp "$cfg" "$cfg.orig" 2>>"$LOG" || true
+                  if sed -i 's/^\([[:space:]]*append .*\)/\1 console=ttyS0,115200n8/' "$cfg" 2>>"$LOG"; then NSER=$((NSER+1)); fi
+                fi
+              done
+              ok "Serial-Tweak: $NSER cfg-Datei(en) mit console=ttyS0 (Kernel-Log per 'qm terminal $VMID' lesbar)."
+            fi
           umount "$MNT" 2>>"$LOG" || warn "umount $MNT fehlgeschlagen – bitte manuell: umount $MNT"
         else
           warn "ESP-Mount fehlgeschlagen – Tweak übersprungen."
@@ -529,6 +554,9 @@ echo "  Zugriff  : KEINE Web-UI (FygoOS ist ein Desktop-OS!) – Zugriff über n
 echo "             Proxmox-WebUI -> VM $VMID -> Konsole. Erster Boot dauert Minuten."
 echo "  Starten  : qm start $VMID     Stoppen: qm stop $VMID     Konfig: qm config $VMID"
 echo "  GRUB-Tweak: $([ "${GRUB_TWEAK:-1}" = "1" ] && echo "nomodeset aktiv (ESP/grub.cfg + .orig-Backup)" || echo "aus (--no-grub-tweak)")"
+if [ "${SERIAL_CONSOLE:-0}" = "1" ]; then
+echo "  Kernel-Log: qm terminal $VMID  (oder: timeout 60 socat - UNIX-CONNECT:/var/run/qemu-server/$VMID.serial)"
+fi
 echo "  Log      : $LOG"
 echo ""
 echo "  Falls schwarzer Bildschirm / Boot hängt / keine IP (bekannt, siehe Forum):"

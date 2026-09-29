@@ -43,7 +43,18 @@ Das Skript (`set -euo pipefail`, `trap ERR` mit Befehl+Zeile+Exit-Code):
 3. erstellt die VM (`ostype l26`, `cpu host`, UEFI+efidisk, VirtIO-Net, `vga std`, Guest-Agent aus, `onboot: 1`),
 4. lädt das Image (`.img.xz` per `xz -d`, `.bin.zip` per `unzip`), importiert per `qm disk import`, hängt als `sata0` mit `boot order=sata0` ein, erweitert auf Zielgröße,
 5. **GRUB-/syslinux-Tweak** (Default an, `--no-grub-tweak` zum Abschalten): mappt die ESP per `kpartx`, sichert `grub.cfg` + `syslinux/*.cfg` (`*.orig`) und ersetzt `i915.modeset=1` durch `i915.modeset=0 nomodeset` (QEMU hat keine Intel-GPU; dm-verity bleibt unangetastet – der syslinux-Teil ist der SeaBIOS-Bootpfad) – best-effort, bricht die Installation bei Fehlern nicht ab,
-6. verifiziert `qm config` (sata0 + onboot) und `qm status` (running), sucht bis 90 s per ARP die DHCP-IP und gibt alles aus.
+6. verifiziert `qm config` (Bootdisk + onboot) und `qm status` (running), sucht bis 90 s per ARP die DHCP-IP und gibt alles aus.
+
+## Kernel hängt? Serial-Console-Debug
+
+```bash
+bash fygoos.sh --serial-console   # oder SERIAL_CONSOLE=1 ...
+qm terminal <VMID>                # Kernel-Log live (Beenden: Ctrl+O)
+# nicht-interaktiv mitschneiden:
+timeout 60 socat - UNIX-CONNECT:/var/run/qemu-server/<VMID>.serial
+```
+
+Das hängt `console=ttyS0,115200n8` an alle syslinux-`append`-Zeilen (idempotent: kein Doppel-Eintrag) und legt `serial0` an. Die letzten Kernel-Zeilen vor dem Stillstand nennen die echte Ursache (`Waiting for root device`, `Kernel panic`, Treiber-Fehler).
 
 ## Von vorne (alte VM weg, neu mit 126er-Erkenntnissen)
 
