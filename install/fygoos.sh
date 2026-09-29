@@ -390,7 +390,7 @@ log "Importiere Disk nach $STORAGE (qm disk import, dauert) ..."
 if [ "$DRY_RUN" = "1" ]; then
   echo "[DRY] qm disk import $VMID $RAW_FILE $STORAGE"
   echo "[DRY] qm set $VMID --${BOOT_DEV} $STORAGE:vm-$VMID-disk-0 --boot order=${BOOT_DEV}"
-  if [ "${GRUB_TWEAK:-1}" = "1" ]; then echo "[DRY] GRUB-Tweak: kpartx ESP mappen, grub.cfg sichern, s/i915.modeset=1/i915.modeset=0 nomodeset/"; else echo "[DRY] GRUB-Tweak deaktiviert"; fi
+  if [ "${GRUB_TWEAK:-1}" = "1" ]; then echo "[DRY] GRUB-Tweak: kpartx ESP mappen, grub.cfg + syslinux/*.cfg sichern, s/i915.modeset=1/i915.modeset=0 nomodeset/"; else echo "[DRY] GRUB-Tweak deaktiviert"; fi
   echo "[DRY] GPT-Backup fixieren (sgdisk -e), falls sgdisk vorhanden"
 else
   run qm disk import "$VMID" "$RAW_FILE" "$STORAGE" 2>&1 | tee -a "$LOG"
@@ -436,13 +436,23 @@ else
         if mount -o rw "$ESP_MAP" "$MNT" 2>>"$LOG"; then
           GRUBCFG="$(find "$MNT" -ipath '*efi/boot/grub.cfg' 2>/dev/null | head -n1 || true)"
           if [ -n "${GRUBCFG:-}" ] && [ -f "$GRUBCFG" ]; then
-            cp "$GRUBCFG" "$GRUBCFG.orig"
-            sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$GRUBCFG"
-            NTWEAK="$(grep -c nomodeset "$GRUBCFG" || true)"
-            ok "GRUB-Tweak gesetzt: ${NTWEAK}x nomodeset in $(basename "$(dirname "$GRUBCFG")")/$(basename "$GRUBCFG") (Backup: grub.cfg.orig)."
-          else
-            warn "efi/boot/grub.cfg nicht auf ESP – Tweak übersprungen."
-          fi
+              cp "$GRUBCFG" "$GRUBCFG.orig"
+              sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$GRUBCFG" || warn "sed grub.cfg fehlgeschlagen."
+              NTWEAK="$(grep -c nomodeset "$GRUBCFG" || true)"
+              ok "GRUB-Tweak gesetzt: ${NTWEAK}x nomodeset in $(basename "$(dirname "$GRUBCFG")")/$(basename "$GRUBCFG") (Backup: grub.cfg.orig)."
+            else
+              warn "efi/boot/grub.cfg nicht auf ESP – GRUB-Teil übersprungen."
+            fi
+            # SeaBIOS-Pfad bootet via MBR->syslinux (NICHT grub.cfg) -> dort ebenfalls nomodeset
+            NSYS=0
+            for cfg in "$MNT"/syslinux/*.cfg "$MNT"/syslinux.cfg; do
+              [ -f "$cfg" ] || continue
+              if grep -q "i915.modeset=1" "$cfg" 2>/dev/null; then
+                cp "$cfg" "$cfg.orig" 2>>"$LOG" || true
+                if sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$cfg" 2>>"$LOG"; then NSYS=$((NSYS+1)); fi
+              fi
+            done
+            ok "syslinux-Tweak: $NSYS cfg-Datei(en) mit nomodeset gepatcht (SeaBIOS-Boot)."
           umount "$MNT" 2>>"$LOG" || warn "umount $MNT fehlgeschlagen – bitte manuell: umount $MNT"
         else
           warn "ESP-Mount fehlgeschlagen – Tweak übersprungen."
