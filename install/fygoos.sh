@@ -7,6 +7,7 @@
 #   bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
 #   VMID=200 CORES=4 RAM=8192 DISK=32 bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
 #   bash fygoos.sh --variant iris --vmid 200 --cores 4 --memory 8192 --disk 32 --storage local-lvm --bridge vmbr0 --nic e1000
+#   bash fygoos.sh --boot-disk virtio --bios seabios   # alternativen Boot-Pfad testen
 #   bash fygoos.sh --image-url https://.../eigenes.img.xz   # eigene URL schlägt --variant immer
 #   VARIANT=apu bash fygoos.sh                             # auto erkennt sonst per lscpu (AMD->apu, Intel->iris)
 #   bash fygoos.sh --dry-run        # zeigt nur qm-Befehle, ändert nichts
@@ -51,7 +52,8 @@ NIC="${NIC:-virtio}"                   # virtio (Default) oder e1000 (Fallback f
 VARIANT="${VARIANT:-auto}"
 IMAGE_URL="${IMAGE_URL:-}"
 CPU_TYPE="${CPU_TYPE:-host}"           # Forum: "host" löst viele Boot-Hänger
-BIOS="${BIOS:-ovmf}"                   # UEFI; SeaBIOS bootet das GPT-Image meist gar nicht
+BIOS="${BIOS:-ovmf}"                   # ovmf (UEFI, Standard) oder seabios (Experiment: protective MBR hat meist keinen Bootcode -> Erwartung niedrig)
+BOOT_DISK="${BOOT_DISK:-sata}"         # sata (Forum-bewährt) | virtio | scsi – OVMF sieht nicht jeden Controller als Boot-Device
 VGA="${VGA:-std}"                      # Falls schwarz: hinterher "qm set VMID --vga none" + GPU-Passthrough
 GRUB_TWEAK="${GRUB_TWEAK:-1}"          # 1 = i915.modeset=1 -> "i915.modeset=0 nomodeset" in ESP/grub.cfg (QEMU hat keine Intel-GPU; dm-verity bleibt unangetastet). 0 = ESP unverändert lassen.
 START="${START:-1}"                    # 1 = VM nach Erstellung starten, 0 = nur anlegen
@@ -86,6 +88,8 @@ while [ $# -gt 0 ]; do
     --bridge) BRIDGE="$2"; shift 2;;
     --nic) NIC="$2"; shift 2;;
     --variant) VARIANT="$2"; shift 2;;
+    --bios) BIOS="$2"; shift 2;;
+    --boot-disk) BOOT_DISK="$2"; shift 2;;
     --image-url) IMAGE_URL="$2"; shift 2;;
     --cpu) CPU_TYPE="$2"; shift 2;;
     --vga) VGA="$2"; shift 2;;
@@ -134,6 +138,13 @@ ensure_vmid_free() {
     echo "[XX] /etc/pve/qemu-server/${VMID}.conf existiert bereits – breche ab (idempotent, nichts überschrieben)." >&2
     exit 1
   fi
+}
+resolve_boot_dev() {
+  case "$BOOT_DISK" in
+    sata) BOOT_DEV="sata0";;
+    virtio) BOOT_DEV="virtio0";;
+    scsi) BOOT_DEV="scsi0";;
+  esac
 }
 if [ -z "$VMID" ]; then
   if VMID="$(pvesh get /cluster/nextid 2>>"$LOG")"; then
@@ -205,14 +216,19 @@ if [ "${YES:-0}" != "1" ] && [ -t 0 ]; then
   ask BRIDGE "Bridge" "$BRIDGE"
   ask VARIANT "Variante (auto|apu|iris|legacy)" "$VARIANT"
   ask NIC "NIC (virtio|e1000)" "$NIC"
+  _d="$BOOT_DISK"; ask BOOT_DISK "Boot-Disk (sata|virtio|scsi)" "$BOOT_DISK"
+  case "$BOOT_DISK" in sata|virtio|scsi) ;; *) warn "Unbekannt – nehme $_d."; BOOT_DISK="$_d";; esac
+  _d="$BIOS"; ask BIOS "Firmware (ovmf|seabios)" "$BIOS"
+  case "$BIOS" in ovmf|seabios) ;; *) warn "Unbekannt – nehme $_d."; BIOS="$_d";; esac
   echo ""
-  echo "  VM $VMID ($NAME): $CORES vCPU ($CPU_TYPE) / $RAM MB / ${DISK}G auf $STORAGE, Bridge $BRIDGE, Variante $VARIANT, NIC $NIC"
+  echo "  VM $VMID ($NAME): $CORES vCPU ($CPU_TYPE) / $RAM MB / ${DISK}G auf $STORAGE, Bridge $BRIDGE, Variante $VARIANT, NIC $NIC, Boot $BOOT_DISK, FW $BIOS"
   printf 'Installieren? [J/n]: '
   read -r _go || _go=""
   case "$_go" in n|N|nein|NEIN|no|NO) echo "Abgebrochen – nichts geändert."; exit 0;; esac
   echo ""
 fi
 ensure_vmid_free
+resolve_boot_dev
 
 [ "$RAM" -ge 8192 ] 2>/dev/null || warn "RAM=$RAM MB – Forum: 2 GB = Reboot-Loop, 4096 teils Hänger, nimm >= 8192 (Default)."
 [ "$NIC" = "virtio" ] || [ "$NIC" = "e1000" ] || { echo "[XX] NIC muss 'virtio' oder 'e1000' sein (gewählt: $NIC)." >&2; exit 1; }
@@ -220,7 +236,13 @@ ensure_vmid_free
 [ "$CORES" -ge 2 ] 2>/dev/null || warn "CORES=$CORES – nimm >= 2 (Default 4, Typ host)."
 [ "$DISK" -ge 20 ] 2>/dev/null || warn "DISK=$DISK GB – Image ist ~7 GB entpackt, nimm >= 20 (Default 32)."
 [ "$CPU_TYPE" = "host" ] || warn "CPU_TYPE=$CPU_TYPE – Forum empfiehlt 'host' gegen Boot-Hänger."
-[ "$BIOS" = "ovmf" ] || warn "BIOS=$BIOS – Forum/Tests: SeaBIOS bootet das Image meist nicht, nimm ovmf."
+[ "$BIOS" = "ovmf" ] || [ "$BIOS" = "seabios" ] || { echo "[XX] BIOS muss 'ovmf' oder 'seabios' sein (gewählt: $BIOS)." >&2; exit 1; }
+[ "$BIOS" = "ovmf" ] || warn "BIOS=$BIOS – Experiment: GPT-Schutz-MBR enthält meist keinen Bootcode, SeaBIOS-Boot unwahrscheinlich. efidisk wird übersprungen."
+case "$BOOT_DISK" in
+  sata|virtio|scsi) ;;
+  *) echo "[XX] BOOT_DISK muss 'sata', 'virtio' oder 'scsi' sein (gewählt: $BOOT_DISK)." >&2; exit 1;;
+esac
+resolve_boot_dev
 
 # ---------- Variante auflösen (VOR qm create, damit eine falsche URL keine VM-Leiche hinterlässt) ----------
 URL_APU="https://download.fydeos.io/FydeOS_for_PC_apu_v18.0-SP1-io-stable.img.xz"
@@ -367,18 +389,31 @@ fi
 log "Importiere Disk nach $STORAGE (qm disk import, dauert) ..."
 if [ "$DRY_RUN" = "1" ]; then
   echo "[DRY] qm disk import $VMID $RAW_FILE $STORAGE"
-  echo "[DRY] qm set $VMID --sata0 $STORAGE:vm-$VMID-disk-0 --boot order=sata0"
+  echo "[DRY] qm set $VMID --${BOOT_DEV} $STORAGE:vm-$VMID-disk-0 --boot order=${BOOT_DEV}"
   if [ "${GRUB_TWEAK:-1}" = "1" ]; then echo "[DRY] GRUB-Tweak: kpartx ESP mappen, grub.cfg sichern, s/i915.modeset=1/i915.modeset=0 nomodeset/"; else echo "[DRY] GRUB-Tweak deaktiviert"; fi
+  echo "[DRY] GPT-Backup fixieren (sgdisk -e), falls sgdisk vorhanden"
 else
   run qm disk import "$VMID" "$RAW_FILE" "$STORAGE" 2>&1 | tee -a "$LOG"
   UNUSED="$(qm config "$VMID" | grep -oP '^unused0: \K[^,]+' | head -n1 || true)"
   [ -n "${UNUSED:-}" ] || { echo "[XX] unused0 nach 'qm disk import' nicht gefunden (qm config $VMID prüfen)." >&2; exit 1; }
   # Forum-bewährt: als SATA einhängen (SCSI/IDE/VirtIO booten oft gar nicht)
-  run qm set "$VMID" --sata0 "$UNUSED" 2>&1 | tee -a "$LOG"
-  run qm set "$VMID" --boot "order=sata0" 2>&1 | tee -a "$LOG"
+  run qm set "$VMID" --${BOOT_DEV} "$UNUSED" 2>&1 | tee -a "$LOG"
+  run qm set "$VMID" --boot "order=${BOOT_DEV}" 2>&1 | tee -a "$LOG"
   # Auf Zielgröße erweitern (Image selbst ist ~7 GB, thin)
   if [ "$DISK" -gt 8 ] 2>/dev/null; then
-    run qm resize "$VMID" sata0 "${DISK}G" 2>&1 | tee -a "$LOG" || warn "qm resize fehlgeschlagen – VM nutzt Image-Größe, läuft trotzdem."
+    run qm resize "$VMID" "$BOOT_DEV" "${DISK}G" 2>&1 | tee -a "$LOG" || warn "qm resize fehlgeschlagen – VM nutzt Image-Größe, läuft trotzdem."
+  fi
+  # GPT-Backup-Header ans Disk-Ende versetzen (qm resize verschiebt das Ende;
+  # parted/kpartx/OVMF meckern sonst über "Alternate GPT header not at end"). Best-effort.
+  if command -v sgdisk >/dev/null; then
+    DISK_DEV_FIX="$(pvesm path "$UNUSED" 2>/dev/null || true)"
+    if [ -n "${DISK_DEV_FIX:-}" ] && [ -e "$DISK_DEV_FIX" ]; then
+      sgdisk -e "$DISK_DEV_FIX" >>"$LOG" 2>&1 && ok "GPT-Backup-Header ans Ende versetzt." || warn "sgdisk -e fehlgeschlagen – harmlos (primäre GPT ist intakt), weiter."
+    else
+      warn "Backing-Device für GPT-Fix nicht auflösbar – übersprungen (harmlos)."
+    fi
+  else
+    warn "sgdisk fehlt (apt install gdisk) – GPT-Backup bleibt versetzt (harmlos, nur Warnungen bei parted/kpartx)."
   fi
   # ---------- GRUB-Tweak auf der ESP (best-effort, bricht Install bei Fehler NICHT ab) ----------
   # Befund: FydeOS-Kernel hängt mit i915.modeset=1 (keine Intel-GPU unter QEMU).
@@ -422,12 +457,12 @@ fi
 
 # ---------- Verifikation ----------
 if [ "$DRY_RUN" = "1" ]; then
-  echo "[DRY] qm config $VMID | grep -E 'sata0|boot|efidisk|onboot'"
+  echo "[DRY] qm config $VMID | grep -E '$BOOT_DEV|boot|efidisk|onboot'"
 else
   log "Verifiziere ..."
   qm config "$VMID" 2>&1 | tee -a "$LOG"
-  qm config "$VMID" | grep -q "sata0:" || { echo "[XX] sata0 fehlt in qm config $VMID." >&2; exit 1; }
-  ok "Bootdisk sata0 vorhanden."
+  qm config "$VMID" | grep -q "$BOOT_DEV:" || { echo "[XX] $BOOT_DEV fehlt in qm config $VMID." >&2; exit 1; }
+  ok "Bootdisk $BOOT_DEV vorhanden."
   qm config "$VMID" | grep -q "onboot: 1" || warn "onboot nicht gesetzt."
   ok "onboot gesetzt (reboot-sicher)."
 fi
@@ -478,7 +513,7 @@ fi
 echo ""
 echo "════════════════ FYGOOS VM ERSTELLT ════════════════"
 echo "  VM       : $VMID ($NAME) – $CORES vCPU ($CPU_TYPE) / $RAM MB / ${DISK}G"
-echo "  Storage  : $STORAGE (sata0, Boot order=sata0, BIOS=$BIOS, onboot=1)"
+echo "  Storage  : $STORAGE ($BOOT_DEV, Boot order=$BOOT_DEV, BIOS=$BIOS, onboot=1)"
 echo "  IP       : ${VM_IP:-<noch keine – Konsole: Proxmox-WebUI -> VM $VMID -> noVNC>}"
 echo "  Zugriff  : KEINE Web-UI (FygoOS ist ein Desktop-OS!) – Zugriff über noVNC-Konsole"
 echo "             Proxmox-WebUI -> VM $VMID -> Konsole. Erster Boot dauert Minuten."
