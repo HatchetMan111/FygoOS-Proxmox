@@ -41,12 +41,13 @@ STORAGE="${STORAGE:-}"                 # leer = Auto-Erkennung (local-lvm > loca
 BRIDGE="${BRIDGE:-}"                   # leer = vmbr0 falls vorhanden, sonst erste vmbr*
 NIC="${NIC:-virtio}"                   # virtio (Default) oder e1000 (Fallback falls FygoOS kein Netz bekommt)
 # Welche FydeOS-for-PC-Variante (Host-CPU/GPU passend wählen!):
-#   auto   = per lscpu erkennen (AMD -> apu, Intel -> iris), Fallback apu
-#   apu    = AMD-Grafik (doppelt: AMD- oder Intel-CPU ab ~2011 + AMD-GPU) – Direkt-Link v18
+#   auto   = per lscpu erkennen (AMD -> apu, Celeron/Pentium -> slim, sonst Intel -> iris)
+#   apu    = AMD-Grafik (AMD- oder Intel-CPU ab ~2011 + AMD-GPU) – Direkt-Link v18
 #   iris   = Intel Modern (Intel Core 6.-14. Gen mit HD/UHD/Xe) – Direkt-Link v18
-#   legacy = Intel Legacy (Core 3.-5. Gen, supportet FydeOS nicht mehr) – KEIN Direkt-Link:
-#            Image (.img.xz, z. B. v19) manuell von https://fydeos.io/download/pc/intel-hd/
-#            laden und per --image-url / IMAGE_URL übergeben.
+#   slim   = Intel Slim (Celeron/Pentium ca. 2015-2019, z. B. J4105 – KEIN Direkt-Link,
+#            nur Drive/iCloud auf https://fydeos.io/download/): .bin.zip manuell laden,
+#            per scp nach /var/tmp kopieren und per --image-url file:///var/tmp/<datei>.bin.zip übergeben
+#   legacy = Intel Legacy (Core 3.-5. Gen, supportet FydeOS nicht mehr) – wie slim per --image-url.
 # Eigene URL schlägt die Tabelle immer: --image-url <URL> oder IMAGE_URL=<URL>.
 # Aktuelle Releases (v20+) sind .bin.zip via Drive/iCloud (nicht direkt ladbar) –
 # dafür eine .bin.zip-URL übergeben (wird per unzip entpackt) oder v18-.img.xz nehmen.
@@ -217,7 +218,7 @@ if [ "${YES:-0}" != "1" ] && [ -t 0 ]; then
   is_num "$DISK" || { warn "Keine Zahl – nehme $_d."; DISK="$_d"; }
   ask STORAGE "Storage" "$STORAGE"
   ask BRIDGE "Bridge" "$BRIDGE"
-  ask VARIANT "Variante (auto|apu|iris|legacy)" "$VARIANT"
+  ask VARIANT "Variante (auto|apu|iris|slim|legacy)" "$VARIANT"
   ask NIC "NIC (virtio|e1000)" "$NIC"
   _d="$BOOT_DISK"; ask BOOT_DISK "Boot-Disk (sata|virtio|scsi)" "$BOOT_DISK"
   case "$BOOT_DISK" in sata|virtio|scsi) ;; *) warn "Unbekannt – nehme $_d."; BOOT_DISK="$_d";; esac
@@ -253,20 +254,26 @@ resolve_boot_dev
 URL_APU="https://download.fydeos.io/FydeOS_for_PC_apu_v18.0-SP1-io-stable.img.xz"
 URL_IRIS="https://download.fydeos.io/FydeOS_for_PC_iris_v18.0-SP1-io-stable.img.xz"
 if [ "$VARIANT" = "auto" ]; then
-  if command -v lscpu >/dev/null 2>&1 && lscpu 2>/dev/null | grep -qi "AuthenticAMD"; then
+  CPUINFO="$(lscpu 2>/dev/null || cat /proc/cpuinfo 2>/dev/null || true)"
+  if echo "$CPUINFO" | grep -qi "AuthenticAMD"; then
     VARIANT="apu"; log "CPU-Erkennung: AMD -> Variante apu"
-  elif command -v lscpu >/dev/null 2>&1 && lscpu 2>/dev/null | grep -qi "GenuineIntel"; then
+  elif echo "$CPUINFO" | grep -qiE "celeron|pentium"; then
+    VARIANT="slim"; log "CPU-Erkennung: Celeron/Pentium -> Variante slim (Intel Slim, z. B. J4105)"
+  elif echo "$CPUINFO" | grep -qi "GenuineIntel"; then
     VARIANT="iris"; log "CPU-Erkennung: Intel -> Variante iris (Core 6.-14. Gen). Bei Core 3.-5. Gen: --variant legacy + IMAGE_URL von https://fydeos.io/download/pc/intel-hd/"
   else
-    VARIANT="apu"; warn "CPU-Hersteller nicht erkennbar (lscpu?) – nehme apu (Forum-bewährt). Per --variant iris|apu|legacy übersteuerbar."
+    VARIANT="apu"; warn "CPU-Hersteller nicht erkennbar (lscpu?) – nehme apu (Forum-bewährt). Per --variant apu|iris|slim|legacy übersteuerbar."
   fi
 fi
 if [ -z "${IMAGE_URL:-}" ]; then
   case "$VARIANT" in
     apu) IMAGE_URL="$URL_APU";;
     iris) IMAGE_URL="$URL_IRIS";;
-    legacy|slim) echo "[XX] Variante '$VARIANT' hat keinen Direkt-Link (FydeOS liefert v20+ nur via Drive/iCloud). Image manuell von https://fydeos.io/download/ laden und per --image-url <URL> übergeben." >&2; exit 1;;
-    *) echo "[XX] Unbekannte Variante: $VARIANT (erlaubt: auto, apu, iris, legacy + --image-url)." >&2; exit 1;;
+    slim|legacy) echo "[XX] Variante '$VARIANT' hat keinen Direkt-Link (FydeOS liefert v20+ nur via Drive/iCloud auf https://fydeos.io/download/)." >&2
+      echo "[XX] So geht's: Variante ($VARIANT) als .bin.zip auf einem PC laden, per scp nach /var/tmp kopieren," >&2
+      echo "[XX] dann: IMAGE_URL=file:///var/tmp/<datei>.bin.zip bash fygoos.sh  (ZIP-Support ist eingebaut)." >&2
+      exit 1;;
+    *) echo "[XX] Unbekannte Variante: $VARIANT (erlaubt: auto, apu, iris, slim, legacy + --image-url)." >&2; exit 1;;
   esac
   log "Variante $VARIANT -> $IMAGE_URL"
 else
