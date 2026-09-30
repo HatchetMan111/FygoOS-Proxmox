@@ -306,10 +306,10 @@ run qm create "$VMID" --name "$NAME" --ostype l26 \
   --vga "$VGA" \
   --onboot 1 --agent enabled=0
 
-# EFI-Disk für OVMF (nötig zum Booten)
+# EFI-Disk für OVMF (nötig zum Booten). Bewusst OHNE pre-enrolled-keys:
+# FydeOS-GRUB ist nicht Microsoft-signiert, mit Keys lädt Secure Boot ihn u. U. gar nicht erst.
 if [ "$BIOS" = "ovmf" ]; then
-  run qm set "$VMID" --efidisk0 "${STORAGE}:1,efitype=4m,pre-enrolled-keys=1" 2>&1 | tee -a "$LOG" || \
-    run qm set "$VMID" --efidisk0 "${STORAGE}:1" 2>&1 | tee -a "$LOG"
+  run qm set "$VMID" --efidisk0 "${STORAGE}:1" 2>&1 | tee -a "$LOG" || die "efidisk anlegen fehlgeschlagen."
 fi
 
 # Serielle Konsole für Kernel-Log (nur mit --serial-console / SERIAL_CONSOLE=1)
