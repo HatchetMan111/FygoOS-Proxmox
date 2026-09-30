@@ -56,13 +56,16 @@ timeout 60 socat - UNIX-CONNECT:/var/run/qemu-server/<VMID>.serial
 
 Das hängt `console=ttyS0,115200n8` an alle syslinux-`append`-Zeilen (idempotent: kein Doppel-Eintrag) und legt `serial0` an. Die letzten Kernel-Zeilen vor dem Stillstand nennen die echte Ursache (`Waiting for root device`, `Kernel panic`, Treiber-Fehler).
 
-## Von vorne (alte VM weg, neu mit 126er-Erkenntnissen)
+## Neu installieren / Variante wechseln (ohne Altlasten)
 
 ```bash
-qm stop 126 && qm destroy 126 --purge
-VARIANT=apu NIC=e1000 VGA=virtio bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
-# Varianten: auto (Default) | apu | iris | legacy (legacy nur mit --image-url)
+qm stop <ID> && qm destroy <ID> --purge   # alte VM weg (spart Thin-Pool-Platz)
+VARIANT=auto NIC=e1000 VGA=virtio BIOS=seabios bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
+# VARIANT: auto (Default, lscpu: AMD→apu, Celeron/Pentium→slim, Intel→iris) | apu | iris | slim | legacy
+#          slim/legacy haben keinen Direkt-Link → .bin.zip manuell laden, scp nach /var/tmp,
+#          dann IMAGE_URL=file:///var/tmp/<datei>.bin.zip ...
 # GRUB-Tweak abschalten: GRUB_TWEAK=0 ...  bzw.  bash fygoos.sh --no-grub-tweak
+# Weitere Wege: --boot-disk sata|virtio|scsi, --bios ovmf|seabios, --serial-console (Kernel-Log)
 ```
 
 Erwartete Schlussausgabe (Beispiel):
@@ -73,8 +76,8 @@ Erwartete Schlussausgabe (Beispiel):
 [OK] VM läuft (qm status = running).
 
 ════════════════ FYGOOS VM ERSTELLT ════════════════
-  VM       : 100 (fygoos) – 4 vCPU (host) / 4096 MB / 32G
-  Storage  : local-lvm (sata0, Boot order=sata0, BIOS=ovmf, onboot=1)
+  VM       : 100 (fygoos) – 4 vCPU (host) / 8192 MB / 32G
+  Storage  : local-lvm (Bootdisk + Boot-Order je nach --boot-disk, BIOS je nach --bios, onboot=1)
   Starten  : qm start 100     Stoppen: qm stop 100     Konfig: qm config 100
   Konsole  : Proxmox-WebUI -> VM 100 -> Konsole (noVNC). Erster Boot dauert Minuten.
   ...
