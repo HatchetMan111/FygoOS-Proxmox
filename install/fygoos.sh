@@ -264,40 +264,14 @@ esac
 resolve_boot_dev
 
 # ---------- Variante auflösen (VOR qm create, damit eine falsche URL keine VM-Leiche hinterlässt) ----------
-URL_APU="https://download.fydeos.io/FydeOS_for_PC_apu_v18.0-SP1-io-stable.img.xz"
-URL_IRIS="https://download.fydeos.io/FydeOS_for_PC_iris_v18.0-SP1-io-stable.img.xz"
-# Intel Slim v23.0-SP1 (kein fydeos.io-Direktlink; Google-Drive-Mirror von https://fydeos.io/download/pc/intel-slim/)
-GDRIVE_SLIM_ID="1OF0eklHZLyBZftMljybjVf4bNpht2Eu6"
-GDRIVE_SLIM_NAME="FydeOS_for_PC_slim_v23.0-SP1-io.bin.zip"
-GDRIVE_SLIM_SHA="4679828fcc5300c2006a988076e8846ad5c77d7a7a45eb3c8bfcdc478f1cb2c8"
-download_gdrive() { # download_gdrive FILEID DEST – Drive-Download via Warnseiten-uuid (ohne uuid liefert Drive nur eine HTML-Warnseite!)
-  local _id="$1" _dest="$2" _uuid _cj="$TMPDIR_WORK/.gcookies"
-  if [ "$DRY_RUN" = "1" ]; then echo "[DRY] download_gdrive $_id $_dest (Warnseite -> uuid -> usercontent-Download)"; return 0; fi
-  log "Lade Google-Drive-Datei (kann >2 GB sein, dauert je nach Leitung) ..."
-  rm -f "$_cj" "$_dest"
-  mkdir -p "$TMPDIR_WORK"
-  _uuid="$(curl -fsSL --max-time 60 -c "$_cj" -b "$_cj" "https://drive.google.com/uc?export=download&id=${_id}" 2>>"$LOG" | grep -oE 'name="uuid" value="[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
-  if [ -z "${_uuid:-}" ]; then
-    rm -f "$_cj"
-    echo "[XX] Drive-Warnseite liefert keine Session-uuid – Direktdownload unmöglich." >&2
-    echo "[XX] Fallback: Datei manuell von https://fydeos.io/download/ laden, per scp nach /var/tmp kopieren," >&2
-    echo "[XX] dann per --image-url file:///var/tmp/<datei>.bin.zip übergeben." >&2
-    return 1
-  fi
-  if ! curl -fSL --retry 2 --retry-delay 10 -c "$_cj" -b "$_cj" -o "$_dest" "https://drive.usercontent.google.com/download?id=${_id}&export=download&confirm=t&uuid=${_uuid}" 2>&1 | tee -a "$LOG"; then
-    rm -f "$_cj" "$_dest"
-    echo "[XX] Google-Drive-Download fehlgeschlagen (s. Fallback oben)." >&2
-    return 1
-  fi
-  rm -f "$_cj"
-  [ -s "$_dest" ] || { echo "[XX] Download leer." >&2; return 1; }
-  if ! unzip -l "$_dest" >/dev/null 2>&1; then
-    rm -f "$_dest"
-    echo "[XX] Download ist kein gültiges ZIP (Abbruch/HTML-Seite) – Datei gelöscht, Installer erneut starten." >&2
-    return 1
-  fi
-  return 0
-}
+URL_APU="https://download.fydeos.io/v23.0-SP1/FydeOS_for_PC_apu_v23.0-SP1-io.bin.zip"
+URL_IRIS="https://download.fydeos.io/v23.0-SP1/FydeOS_for_PC_iris_v23.0-SP1-io.bin.zip"
+URL_SLIM="https://download.fydeos.io/v23.0-SP1/FydeOS_for_PC_slim_v23.0-SP1-io.bin.zip"
+# SHA-256 von den offiziellen Download-Seiten (fydeos.io/download/pc/*/); leere = keine Prüfung
+SHA_APU="5902b60621d08af92816793f657affd1f3ac535c36acb8e0dfb0dd9bd3d5489b"
+SHA_IRIS="21de5a478da1db4d973ea252bd708d10ceef3d8219689a0b7f7faee2a8e47f02"
+SHA_SLIM="4679828fcc5300c2006a988076e8846ad5c77d7a7a45eb3c8bfcdc478f1cb2c8"
+EXPECT_SHA=""
 if [ "$VARIANT" = "auto" ]; then
   CPUINFO="$(lscpu 2>/dev/null || cat /proc/cpuinfo 2>/dev/null || true)"
   if echo "$CPUINFO" | grep -qi "AuthenticAMD"; then
@@ -312,10 +286,9 @@ if [ "$VARIANT" = "auto" ]; then
 fi
 if [ -z "${IMAGE_URL:-}" ]; then
   case "$VARIANT" in
-    apu) IMAGE_URL="$URL_APU";;
-    iris) IMAGE_URL="$URL_IRIS";;
-    slim) GDRIVE_ID="$GDRIVE_SLIM_ID"; GDRIVE_NAME="$GDRIVE_SLIM_NAME"; GDRIVE_SHA="$GDRIVE_SLIM_SHA"
-      IMAGE_URL="gdrive:$GDRIVE_ID/$GDRIVE_NAME";;
+    apu) IMAGE_URL="$URL_APU"; EXPECT_SHA="$SHA_APU";;
+    iris) IMAGE_URL="$URL_IRIS"; EXPECT_SHA="$SHA_IRIS";;
+    slim) IMAGE_URL="$URL_SLIM"; EXPECT_SHA="$SHA_SLIM";;
     legacy) echo "[XX] Variante 'legacy' hat keinen Direkt-Link (FydeOS liefert v20+ nur via Drive/iCloud auf https://fydeos.io/download/)." >&2
       echo "[XX] So geht's: Variante ($VARIANT) als .bin.zip auf einem PC laden, per scp nach /var/tmp kopieren," >&2
       echo "[XX] dann: IMAGE_URL=file:///var/tmp/<datei>.bin.zip bash fygoos.sh  (ZIP-Support ist eingebaut)." >&2
@@ -332,29 +305,15 @@ esac
 # Preflight: URL erreichbar? (Range-Request, lädt nur 1 KB – fängt 404/typo bevor eine VM angelegt wird)
 log "Prüfe Image-URL (Preflight) ..."
 if [ "$DRY_RUN" = "1" ]; then
-  case "$IMAGE_URL" in
-    gdrive:*) echo "[DRY] curl -fsSL --max-time 30 -r 0-1023 -o /dev/null drive.usercontent.google.com/download?id=${GDRIVE_ID:-?}...";;
-    *) echo "[DRY] curl -fsSL --max-time 30 -r 0-1023 -o /dev/null $IMAGE_URL";;
-  esac
+  echo "[DRY] curl -fsSL --max-time 30 -r 0-1023 -o /dev/null $IMAGE_URL"
 else
-  case "$IMAGE_URL" in
-    gdrive:*)
-      GDRIVE_ID="${IMAGE_URL#gdrive:}"; GDRIVE_ID="${GDRIVE_ID%%/*}"
-      if curl -fsSL --max-time 30 -r 0-1023 -o /dev/null "https://drive.usercontent.google.com/download?id=${GDRIVE_ID}&export=download&confirm=t" 2>>"$LOG"; then
-        ok "Google-Drive-Datei erreichbar."
-      else
-        echo "[XX] Google-Drive-Datei nicht ladbar (ID $GDRIVE_ID)." | tee -a "$LOG" >&2
-        exit 1
-      fi;;
-    *)
-      if command -v curl >/dev/null && curl -fsSL --max-time 30 -r 0-1023 -o /dev/null "$IMAGE_URL" 2>>"$LOG"; then
-        ok "Image-URL erreichbar."
-      else
-        echo "[XX] Image-URL nicht ladbar: $IMAGE_URL" | tee -a "$LOG" >&2
-        echo "[XX] Falsche Variante? Aktuell: $VARIANT. Versuche VARIANT=apu|iris|slim oder eine eigene URL von https://fydeos.io/download/ per --image-url." | tee -a "$LOG" >&2
-        exit 1
-      fi;;
-  esac
+  if command -v curl >/dev/null && curl -fsSL --max-time 30 -r 0-1023 -o /dev/null "$IMAGE_URL" 2>>"$LOG"; then
+    ok "Image-URL erreichbar."
+  else
+    echo "[XX] Image-URL nicht ladbar: $IMAGE_URL" | tee -a "$LOG" >&2
+    echo "[XX] Falsche Variante? Aktuell: $VARIANT. Versuche VARIANT=apu|iris|slim oder eine eigene URL von https://fydeos.io/download/ per --image-url." | tee -a "$LOG" >&2
+    exit 1
+  fi
 fi
 
 run() {
@@ -406,7 +365,7 @@ case "$IMG_BASENAME" in
 esac
 
 if [ -n "${ZIP_FILE:-}" ]; then
-  # v20+: .bin.zip (Drive-Mirror, Direktlink oder manuell per scp nach /var/tmp + file://-URL)
+  # v20+: .bin.zip (Direktlink, oder manuell per scp nach /var/tmp + file://-URL)
   # Nur Größe prüfen reicht NICHT (abgebrochene Downloads!) – unzip -l liest nur das
   # Zentralverzeichnis am Dateiende und entlarvt Stümpfe in Sekunden.
   NEED_DL=0
@@ -424,30 +383,21 @@ if [ -n "${ZIP_FILE:-}" ]; then
   if [ "$NEED_DL" = "1" ]; then
     log "Lade Image-ZIP (kann >2 GB sein, dauert) ..."
     if [ "$DRY_RUN" = "1" ]; then
-      case "$IMAGE_URL" in
-        gdrive:*) echo "[DRY] download_gdrive ${GDRIVE_ID:-?} $ZIP_FILE";;
-        *) echo "[DRY] curl -fSL --retry 3 -o $ZIP_FILE $IMAGE_URL";;
-      esac
+      echo "[DRY] curl -fSL --retry 3 -o $ZIP_FILE $IMAGE_URL"
     else
-      case "$IMAGE_URL" in
-        gdrive:*)
-          GDRIVE_ID="${IMAGE_URL#gdrive:}"; GDRIVE_ID="${GDRIVE_ID%%/*}"
-          download_gdrive "$GDRIVE_ID" "$ZIP_FILE" || die "Drive-Download fehlgeschlagen."
-          if [ -n "${GDRIVE_SHA:-}" ]; then
-            GOT_SHA="$(sha256sum "$ZIP_FILE" 2>/dev/null | awk '{print $1}' || true)"
-            if [ "${GOT_SHA:-}" = "$GDRIVE_SHA" ]; then
-              ok "SHA-256 stimmt: $GOT_SHA"
-            else
-              warn "SHA-256 weicht ab (erwartet $GDRIVE_SHA, ist ${GOT_SHA:-?}) – weiter auf eigenes Risiko (unzip prüft die Struktur beim Entpacken)."
-            fi
-          fi;;
-        *)
-          if command -v curl >/dev/null; then
-            curl -fSL --retry 3 --retry-delay 5 -o "$ZIP_FILE" "$IMAGE_URL" 2>&1 | tee -a "$LOG"
-          else
-            wget -O "$ZIP_FILE" "$IMAGE_URL" 2>&1 | tee -a "$LOG"
-          fi;;
-      esac
+      if command -v curl >/dev/null; then
+        curl -fSL --retry 3 --retry-delay 5 -o "$ZIP_FILE" "$IMAGE_URL" 2>&1 | tee -a "$LOG"
+      else
+        wget -O "$ZIP_FILE" "$IMAGE_URL" 2>&1 | tee -a "$LOG"
+      fi
+      if [ -n "${EXPECT_SHA:-}" ]; then
+        GOT_SHA="$(sha256sum "$ZIP_FILE" 2>/dev/null | awk '{print $1}' || true)"
+        if [ "${GOT_SHA:-}" = "$EXPECT_SHA" ]; then
+          ok "SHA-256 stimmt: $GOT_SHA"
+        else
+          warn "SHA-256 weicht ab (erwartet $EXPECT_SHA, ist ${GOT_SHA:-?}) – weiter auf eigenes Risiko (unzip prüft die Struktur beim Entpacken)."
+        fi
+      fi
     fi
   fi
   if [ "$DRY_RUN" = "1" ]; then
