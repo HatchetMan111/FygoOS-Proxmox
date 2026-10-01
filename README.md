@@ -56,6 +56,14 @@ timeout 60 socat - UNIX-CONNECT:/var/run/qemu-server/<VMID>.serial
 
 Das hängt `console=ttyS0,115200n8` an alle syslinux-`append`-Zeilen (idempotent: kein Doppel-Eintrag) und legt `serial0` an. Die letzten Kernel-Zeilen vor dem Stillstand nennen die echte Ursache (`Waiting for root device`, `Kernel panic`, Treiber-Fehler).
 
+## Headless Server-Modus (ohne Desktop)
+
+```bash
+bash fygoos.sh --headless   # oder HEADLESS=1 ... (auch in den Prompts als Frage)
+```
+
+Setzt `VGA=none` + `SERIAL_CONSOLE=1`: kein noVNC-Bild (bleibt schwarz — normal!), Zugriff per `qm terminal <VMID>`, SSH sobald Netz oben und `sshd` läuft. Hinweis: FygoOS kennt offiziell keinen Server-Modus — das ist Desktop-OS ohne Grafikkarte. Ob `sshd` läuft und welche Zugangsdaten gelten, zeigt der erste Boot per `qm terminal`.
+
 ## Neu installieren / Variante wechseln (ohne Altlasten)
 
 ```bash

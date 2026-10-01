@@ -17,6 +17,7 @@
 #   bash fygoos.sh --debug          # = bash -x, komplette Fehlermeldungskette + Log unter /tmp/fygoos-install-*.log
 #   bash fygoos.sh --manual         # = --no-start: nur VM hinstellen, Start + Konsole manuell
 #   bash fygoos.sh --serial-console # Kernel-Log auf seriell (Debug per "qm terminal VMID")
+#   bash fygoos.sh --headless       # Server-Modus: VGA=none + serielle Konsole (Zugriff qm terminal/SSH)
 #   bash fygoos.sh --no-grub-tweak  # ESP/grub.cfg unverändert lassen (Default: nomodeset-Tweak aktiv)
 #
 # Warum VM statt LXC: FygoOS ist ein vollständiges ChromeOS-artiges Desktop-OS
@@ -59,6 +60,7 @@ BOOT_DISK="${BOOT_DISK:-sata}"         # sata (Forum-bewährt) | virtio | scsi �
 VGA="${VGA:-std}"                      # Falls schwarz: hinterher "qm set VMID --vga none" + GPU-Passthrough
 GRUB_TWEAK="${GRUB_TWEAK:-1}"          # 1 = i915.modeset=1 -> "i915.modeset=0 nomodeset" in ESP/grub.cfg (QEMU hat keine Intel-GPU; dm-verity bleibt unangetastet). 0 = ESP unverändert lassen.
 SERIAL_CONSOLE="${SERIAL_CONSOLE:-0}"  # 1 = Kernel-Log auf serielle Konsole (syslinux: console=ttyS0,115200n8 + qm serial0) – Debug per "qm terminal VMID". Standard aus.
+HEADLESS="${HEADLESS:-0}"              # 1 = Server-Modus ohne Desktop: VGA=none + SERIAL_CONSOLE=1 (Zugriff per "qm terminal VMID" bzw. SSH). Kein noVNC-Bild!
 START="${START:-1}"                    # 1 = VM nach Erstellung starten, 0 = nur anlegen
 DRY_RUN="${DRY_RUN:-0}"                # 1 = nur Befehle zeigen
 YES="${YES:-0}"                        # 1 = keine Rückfragen (unattended). Default: bei TTY interaktiv abfragen
@@ -99,6 +101,7 @@ while [ $# -gt 0 ]; do
     --grub-tweak) GRUB_TWEAK="1"; shift;;
     --no-grub-tweak) GRUB_TWEAK="0"; shift;;
     --serial-console) SERIAL_CONSOLE="1"; shift;;
+    --headless) HEADLESS="1"; shift;;
     --no-start|--manual) START="0"; shift;;   # nur VM hinstellen, Start + Konsole manuell (wie PBS --manual)
     --dry-run) DRY_RUN="1"; shift;;
     --yes|-y) YES="1"; shift;;
@@ -226,8 +229,10 @@ if [ "${YES:-0}" != "1" ] && [ -t 0 ]; then
   case "$BIOS" in ovmf|seabios) ;; *) warn "Unbekannt – nehme $_d."; BIOS="$_d";; esac
   _d="$SERIAL_CONSOLE"; ask SERIAL_CONSOLE "Serielle Kernel-Konsole für Debug (0|1, lesen per: qm terminal VMID)" "$SERIAL_CONSOLE"
   case "$SERIAL_CONSOLE" in 0|1) ;; *) warn "Unbekannt – nehme $_d."; SERIAL_CONSOLE="$_d";; esac
+  _d="$HEADLESS"; ask HEADLESS "Headless Server-Modus ohne Desktop (0|1: VGA=none + serielle Konsole, Zugriff per qm terminal/SSH)" "$HEADLESS"
+  case "$HEADLESS" in 0|1) ;; *) warn "Unbekannt – nehme $_d."; HEADLESS="$_d";; esac
   echo ""
-  echo "  VM $VMID ($NAME): $CORES vCPU ($CPU_TYPE) / $RAM MB / ${DISK}G auf $STORAGE, Bridge $BRIDGE, Variante $VARIANT, NIC $NIC, Boot $BOOT_DISK, FW $BIOS"
+  echo "  VM $VMID ($NAME): $CORES vCPU ($CPU_TYPE) / $RAM MB / ${DISK}G auf $STORAGE, Bridge $BRIDGE, Variante $VARIANT, NIC $NIC, Boot $BOOT_DISK, FW $BIOS, Headless $HEADLESS"
   printf 'Installieren? [J/n]: '
   read -r _go || _go=""
   case "$_go" in n|N|nein|NEIN|no|NO) echo "Abgebrochen – nichts geändert."; exit 0;; esac
@@ -235,6 +240,12 @@ if [ "${YES:-0}" != "1" ] && [ -t 0 ]; then
 fi
 ensure_vmid_free
 resolve_boot_dev
+# Headless Server-Modus: keine Grafikkarte, serielle Konsole als Hauptausgabe
+if [ "${HEADLESS:-0}" = "1" ]; then
+  VGA="none"
+  SERIAL_CONSOLE="1"
+  log "Headless-Modus: VGA=none, SERIAL_CONSOLE=1 (Zugriff per 'qm terminal $VMID' bzw. SSH – noVNC bleibt schwarz)."
+fi
 
 [ "$RAM" -ge 8192 ] 2>/dev/null || warn "RAM=$RAM MB – Forum: 2 GB = Reboot-Loop, 4096 teils Hänger, nimm >= 8192 (Default)."
 [ "$NIC" = "virtio" ] || [ "$NIC" = "e1000" ] || { echo "[XX] NIC muss 'virtio' oder 'e1000' sein (gewählt: $NIC)." >&2; exit 1; }
@@ -559,6 +570,10 @@ echo "  Storage  : $STORAGE ($BOOT_DEV, Boot order=$BOOT_DEV, BIOS=$BIOS, onboot
 echo "  IP       : ${VM_IP:-<noch keine – Konsole: Proxmox-WebUI -> VM $VMID -> noVNC>}"
 echo "  Zugriff  : KEINE Web-UI (FygoOS ist ein Desktop-OS!) – Zugriff über noVNC-Konsole"
 echo "             Proxmox-WebUI -> VM $VMID -> Konsole. Erster Boot dauert Minuten."
+if [ "${HEADLESS:-0}" = "1" ]; then
+echo "  Headless : VGA=none (noVNC bleibt SCHWARZ, normal!) – Zugriff per: qm terminal $VMID"
+echo "             SSH sobald Netz + sshd oben sind: ssh <user>@<IP aus ARP-Zeile oben>"
+fi
 echo "  Starten  : qm start $VMID     Stoppen: qm stop $VMID     Konfig: qm config $VMID"
 echo "  GRUB-Tweak: $([ "${GRUB_TWEAK:-1}" = "1" ] && echo "nomodeset aktiv (ESP/grub.cfg + .orig-Backup)" || echo "aus (--no-grub-tweak)")"
 if [ "${SERIAL_CONSOLE:-0}" = "1" ]; then
