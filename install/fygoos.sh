@@ -270,17 +270,33 @@ URL_IRIS="https://download.fydeos.io/FydeOS_for_PC_iris_v18.0-SP1-io-stable.img.
 GDRIVE_SLIM_ID="1OF0eklHZLyBZftMljybjVf4bNpht2Eu6"
 GDRIVE_SLIM_NAME="FydeOS_for_PC_slim_v23.0-SP1-io.bin.zip"
 GDRIVE_SLIM_SHA="4679828fcc5300c2006a988076e8846ad5c77d7a7a45eb3c8bfcdc478f1cb2c8"
-download_gdrive() { # download_gdrive FILEID DEST – Drive-Direktdownload (confirm=t, ohne Cookies)
-  local _id="$1" _dest="$2"
-  if [ "$DRY_RUN" = "1" ]; then echo "[DRY] curl -fSL drive.usercontent.google.com/download?id=$_id... -o $_dest"; return 0; fi
+download_gdrive() { # download_gdrive FILEID DEST – Drive-Download via Warnseiten-uuid (ohne uuid liefert Drive nur eine HTML-Warnseite!)
+  local _id="$1" _dest="$2" _uuid _cj="$TMPDIR_WORK/.gcookies"
+  if [ "$DRY_RUN" = "1" ]; then echo "[DRY] download_gdrive $_id $_dest (Warnseite -> uuid -> usercontent-Download)"; return 0; fi
   log "Lade Google-Drive-Datei (kann >2 GB sein, dauert je nach Leitung) ..."
-  if curl -fSL --retry 2 --retry-delay 10 -o "$_dest" "https://drive.usercontent.google.com/download?id=${_id}&export=download&confirm=t" 2>&1 | tee -a "$LOG"; then
-    [ -s "$_dest" ] && return 0
+  rm -f "$_cj" "$_dest"
+  mkdir -p "$TMPDIR_WORK"
+  _uuid="$(curl -fsSL --max-time 60 -c "$_cj" -b "$_cj" "https://drive.google.com/uc?export=download&id=${_id}" 2>>"$LOG" | grep -oE 'name="uuid" value="[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
+  if [ -z "${_uuid:-}" ]; then
+    rm -f "$_cj"
+    echo "[XX] Drive-Warnseite liefert keine Session-uuid – Direktdownload unmöglich." >&2
+    echo "[XX] Fallback: Datei manuell von https://fydeos.io/download/ laden, per scp nach /var/tmp kopieren," >&2
+    echo "[XX] dann per --image-url file:///var/tmp/<datei>.bin.zip übergeben." >&2
+    return 1
   fi
-  rm -f "$_dest"
-  echo "[XX] Google-Drive-Download fehlgeschlagen. Fallback: Datei manuell von https://fydeos.io/download/ laden," >&2
-  echo "[XX] per scp nach /var/tmp kopieren und per --image-url file:///var/tmp/<datei>.bin.zip übergeben." >&2
-  return 1
+  if ! curl -fSL --retry 2 --retry-delay 10 -c "$_cj" -b "$_cj" -o "$_dest" "https://drive.usercontent.google.com/download?id=${_id}&export=download&confirm=t&uuid=${_uuid}" 2>&1 | tee -a "$LOG"; then
+    rm -f "$_cj" "$_dest"
+    echo "[XX] Google-Drive-Download fehlgeschlagen (s. Fallback oben)." >&2
+    return 1
+  fi
+  rm -f "$_cj"
+  [ -s "$_dest" ] || { echo "[XX] Download leer." >&2; return 1; }
+  if ! unzip -l "$_dest" >/dev/null 2>&1; then
+    rm -f "$_dest"
+    echo "[XX] Download ist kein gültiges ZIP (Abbruch/HTML-Seite) – Datei gelöscht, Installer erneut starten." >&2
+    return 1
+  fi
+  return 0
 }
 if [ "$VARIANT" = "auto" ]; then
   CPUINFO="$(lscpu 2>/dev/null || cat /proc/cpuinfo 2>/dev/null || true)"
