@@ -74,6 +74,7 @@ warn() { echo "[!!] $*" | tee -a "$LOG" >&2; }
 die()  {
   local code=$?
   echo "[XX] FEHLER (exit=$code) in Befehl: '${BASH_COMMAND}' (Zeile ${BASH_LINENO[0]:-?})" | tee -a "$LOG" >&2
+  echo "[XX] Hinweis: Bei Befehlen mit '| tee' nennt die Zeile ggf. das letzte Kettenglied – entscheidend ist die Fehlermeldung direkt darüber." | tee -a "$LOG" >&2
   echo "[XX] $*" | tee -a "$LOG" >&2
   echo "[XX] Voll-Log: $LOG" | tee -a "$LOG" >&2
   echo "[XX] Tipp: DEBUG=1 bash fygoos.sh ...  (oder --debug) für bash -x Trace" | tee -a "$LOG" >&2
@@ -390,7 +391,21 @@ esac
 
 if [ -n "${ZIP_FILE:-}" ]; then
   # v20+: .bin.zip (Drive-Mirror, Direktlink oder manuell per scp nach /var/tmp + file://-URL)
+  # Nur Größe prüfen reicht NICHT (abgebrochene Downloads!) – unzip -l liest nur das
+  # Zentralverzeichnis am Dateiende und entlarvt Stümpfe in Sekunden.
+  NEED_DL=0
   if [ ! -s "$ZIP_FILE" ]; then
+    NEED_DL=1
+  elif [ "$DRY_RUN" = "1" ]; then
+    ok "Image-ZIP vorhanden (Dry-Run, keine Prüfung): $ZIP_FILE"
+  elif unzip -l "$ZIP_FILE" >/dev/null 2>>"$LOG"; then
+    ok "Image-ZIP bereits vorhanden und Struktur ok: $ZIP_FILE"
+  else
+    warn "Image-ZIP unvollständig/korrupt (früherer Abbruch?) – lösche und lade neu."
+    rm -f "$ZIP_FILE"
+    NEED_DL=1
+  fi
+  if [ "$NEED_DL" = "1" ]; then
     log "Lade Image-ZIP (kann >2 GB sein, dauert) ..."
     if [ "$DRY_RUN" = "1" ]; then
       case "$IMAGE_URL" in
@@ -418,8 +433,6 @@ if [ -n "${ZIP_FILE:-}" ]; then
           fi;;
       esac
     fi
-  else
-    ok "Image-ZIP bereits vorhanden: $ZIP_FILE"
   fi
   if [ "$DRY_RUN" = "1" ]; then
     echo "[DRY] unzip -o $ZIP_FILE -d $TMPDIR_WORK  # .bin -> $RAW_FILE"
@@ -455,7 +468,12 @@ elif [ -n "${XZ_FILE:-}" ]; then
     echo "[DRY] xz -t $XZ_FILE && xz -dkf $XZ_FILE"
   else
     log "Prüfe xz-Archiv ..."
-    xz -t "$XZ_FILE" 2>&1 | tee -a "$LOG"
+    if ! xz -t "$XZ_FILE" 2>&1 | tee -a "$LOG"; then
+      warn "xz-Archiv korrupt (früherer Abbruch?) – lösche $XZ_FILE."
+      rm -f "$XZ_FILE" "$RAW_FILE"
+      echo "[XX] Bitte Installer erneut starten – das Archiv wird neu geladen." >&2
+      exit 1
+    fi
     if [ ! -s "$RAW_FILE" ]; then
       log "Entpacke ($XZ_FILE -> $RAW_FILE, ~7 GB, dauert) ..."
       xz -dkf "$XZ_FILE" 2>&1 | tee -a "$LOG"
