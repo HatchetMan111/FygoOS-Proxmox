@@ -4,6 +4,19 @@
 > Dieses Repo enthält **nur den Proxmox-Installer** (`install/fygoos.sh`). Die Methode folgt dem Forum-Thread `https://forum.proxmox.com/threads/install-fydeos-in-proxmox-ve.149345/` (Post #10, justinclift): `.img.xz` laden → `xz -d` → `qm disk import` → als SATA einhängen.
 > Läuft vollständig lokal, keine Cloud nötig.
 
+## Web-UI: Installer-Konfigurator
+
+Wer nicht am Terminal tippt: Der [interaktive Konfigurator](https://hatchetman111.github.io/FygoOS-Proxmox/) baut den Befehl live – alle Flags und Varianten, plus die Warnungen des Scripts (RAM/Disk/legacy/SeaBIOS) als Vorschau, mit ENV-Einzeiler- und Flags-Stil zum Kopieren.
+
+Lokal entwickeln:
+
+```bash
+cd web && npm install && npm run dev   # Dev-Server
+npm run build                          # Produktions-Build nach web/dist
+```
+
+Deployment: automatisch per GitHub Actions (`.github/workflows/pages.yml`) auf GitHub Pages.
+
 ## Einzeiler (auf dem Proxmox-Host als root)
 
 ```bash
@@ -31,11 +44,11 @@ bash fygoos.sh --no-start  # nur anlegen, nicht starten
 | VM-Name | `fygoos` |
 | Zweck | FygoOS/FydeOS als Desktop-VM (ChromeOS-artig, inkl. Android-/Linux-Support) |
 | Image | FydeOS-for-PC **v23** per `VARIANT`: `auto` (Default, `lscpu`: AMD→`apu`, Celeron/Pentium→`slim`, sonst Intel→`iris`), dazu SHA-256-Prüfung nach Download. `legacy` nur mit eigener `--image-url` (`.bin.zip` manuell laden, per `scp` nach `/var/tmp`, dann `IMAGE_URL=file:///var/tmp/<datei>.bin.zip`) – eigene URL schlägt die Variante immer |
-| Image-Format | v18 `.img.xz` (Direkt-Link, `xz -d`) oder v20+ `.bin.zip` (per `unzip`, z. B. eigene URL) – **kein** `.ova` (nur VMware, bootet unter KVM meist nicht) |
+| Image-Format | v23 `.bin.zip` (per `unzip`, inkl. SHA-256-Prüfung); eigene `.img.xz`-URL entpackt per `xz -d` – **kein** `.ova` (nur VMware, bootet unter KVM meist nicht) |
 | Standard-Ressourcen | 4 vCPU (Typ `host`) / 8192 MB RAM / 32 GB Disk (RAM bewusst hoch: 2 GB = Reboot-Loop, 4096 teils Hänger) |
 | NIC | `virtio` (Default), Fallback `--nic e1000` falls die VM kein Netz bekommt |
 | VMID | immer die **nächste freie ID** (`pvesh get /cluster/nextid`), außer `--vmid` gesetzt |
-| BIOS / Disk | UEFI (`ovmf` + efidisk), Bootdisk `sata0`, `onboot: 1` (reboot-sicher) |
+| BIOS / Disk | UEFI (`ovmf` + efidisk **ohne** Secure-Boot-Keys: `pre-enrolled-keys=0`, FydeOS-GRUB ist unsigniert), Bootdisk `sata0`, `onboot: 1` (reboot-sicher) |
 
 Das Skript (`set -euo pipefail`, `trap ERR` mit Befehl+Zeile+Exit-Code):
 1. prüft root/`qm`/`pvesh`/`pvesm`/`xz`, nimmt die nächste freie VMID, erkennt Storage (`local-lvm` > `local-zfs` > `local`) und Bridge (`vmbr0`),
@@ -126,3 +139,5 @@ qm stop 100 && qm destroy 100 --purge                            # Deinstall
 ## Dateien
 
 - `install/fygoos.sh` – Proxmox-Einzeiler (Host, root).
+- `web/` – React+Vite-Installer-Konfigurator (GitHub Pages, deploy per Workflow).
+- `.github/workflows/pages.yml` – baut `web/` und deployt nach GitHub Pages.

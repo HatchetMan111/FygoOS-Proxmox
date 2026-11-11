@@ -82,7 +82,36 @@ die()  {
 }
 trap 'die "Abbruch."' ERR
 
-usage() { sed -n '2,30p' "$0"; }
+usage() { cat <<'EOF'
+FygoOS (ehem. FydeOS) als VM auf Proxmox VE – Einzeiler-Installer.
+
+Einzeiler (auf dem Proxmox-Host als root):
+  bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)"
+
+Lokal (Repo geklont):
+  bash fygoos.sh --variant iris --vmid 200 --cores 4 --memory 8192 --disk 32 \
+       --storage local-lvm --bridge vmbr0 --nic e1000
+
+ENV oder Flags (gleichwertig; ENV schlägt Default, Flags schlagen ENV):
+  VMID=200 CORES=4 RAM=8192 DISK=32 bash fygoos.sh
+  bash fygoos.sh --boot-disk virtio --bios seabios   # alternativen Boot-Pfad testen
+  bash fygoos.sh --image-url https://.../eigenes.img.xz   # eigene URL schlägt --variant immer
+  VARIANT=apu bash fygoos.sh                         # auto erkennt sonst per lscpu
+
+Steuerung:
+  --yes                keine Rückfragen (unattended, Defaults/ENV/Flags)
+  --dry-run            zeigt nur qm-Befehle, ändert nichts
+  --debug              bash -x-Trace, Log unter /tmp/fygoos-install-*.log
+  --no-start|--manual  nur VM hinstellen, Start + Konsole manuell
+  --serial-console     Kernel-Log auf seriell (lesen per "qm terminal VMID")
+  --headless           Server-Modus: VGA=none + serielle Konsole
+  --no-grub-tweak      ESP/grub.cfg unverändert lassen (Default: nomodeset aktiv)
+  -h|--help            diese Hilfe
+
+Ohne --yes fragt das Script bei TTY zu Beginn ab (VMID, Name, Kerne, RAM, Disk,
+Storage, Bridge, Variante, NIC – Community-Scripts-Stil, Enter = Default).
+EOF
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -308,7 +337,9 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "[DRY] curl -fsSL --max-time 30 -r 0-1023 -o /dev/null $IMAGE_URL"
 else
   if command -v curl >/dev/null && curl -fsSL --max-time 30 -r 0-1023 -o /dev/null "$IMAGE_URL" 2>>"$LOG"; then
-    ok "Image-URL erreichbar."
+    ok "Image-URL erreichbar (Range-Request ok)."
+  elif command -v curl >/dev/null && curl -fsSI --max-time 30 -o /dev/null "$IMAGE_URL" 2>>"$LOG"; then
+    ok "Image-URL erreichbar (Server ignoriert Range-Requests – der Download entscheidet)."
   else
     echo "[XX] Image-URL nicht ladbar: $IMAGE_URL" | tee -a "$LOG" >&2
     echo "[XX] Falsche Variante? Aktuell: $VARIANT. Versuche VARIANT=apu|iris|slim oder eine eigene URL von https://fydeos.io/download/ per --image-url." | tee -a "$LOG" >&2
@@ -333,10 +364,12 @@ run qm create "$VMID" --name "$NAME" --ostype l26 \
   --vga "$VGA" \
   --onboot 1 --agent enabled=0
 
-# EFI-Disk für OVMF (nötig zum Booten). Bewusst OHNE pre-enrolled-keys:
-# FydeOS-GRUB ist nicht Microsoft-signiert, mit Keys lädt Secure Boot ihn u. U. gar nicht erst.
+# EFI-Disk für OVMF (nötig zum Booten). pre-enrolled-keys=0 ist Pflicht:
+# FydeOS-GRUB ist nicht Microsoft-signiert – ohne das Flag enrollt Proxmox die
+# MS-Keys (Default pre-enrolled-keys=1) und Secure Boot lehnt den Loader ab.
 if [ "$BIOS" = "ovmf" ]; then
-  run qm set "$VMID" --efidisk0 "${STORAGE}:1" 2>&1 | tee -a "$LOG" || die "efidisk anlegen fehlgeschlagen."
+  run qm set "$VMID" --efidisk0 "${STORAGE}:1,pre-enrolled-keys=0" 2>&1 | tee -a "$LOG" || die "efidisk anlegen fehlgeschlagen."
+  ok "efidisk0 ohne Secure-Boot-Keys (pre-enrolled-keys=0, FydeOS-GRUB ist unsigniert)."
 fi
 
 # Serielle Konsole für Kernel-Log (nur mit --serial-console / SERIAL_CONSOLE=1)
@@ -569,8 +602,10 @@ if [ "$START" = "1" ]; then
     if qm status "$VMID" 2>/dev/null | grep -q "status: running"; then
       ok "VM läuft (qm status = running)."
       # IP via ARP/Neightable ermitteln (FygoOS hat keinen qemu-guest-agent,
-      # daher DHCP-Lease aus der Host-Neightable der Bridge lesen)
-      VM_MAC="$(qm config "$VMID" | grep -oP '^net0:.*?virtio=\K[0-9a-f:]+' | head -n1 || true)"
+      # daher DHCP-Lease aus der Host-Neightable der Bridge lesen).
+      # MAC generisch aus net0 (virtio=... UND e1000=...), sonst findet der
+      # e1000-Fallback keine IP.
+      VM_MAC="$(qm config "$VMID" | grep -oiP '^net0:.*?\K([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -n1 || true)"
       if [ -n "${VM_MAC:-}" ]; then
         log "Warte auf DHCP-Lease (ARP-Lookup MAC $VM_MAC, max. 90s) ..."
         VM_IP=""
@@ -584,7 +619,7 @@ if [ "$START" = "1" ]; then
         if [ -n "${VM_IP:-}" ]; then
           ok "VM-IP (via ARP auf $BRIDGE): $VM_IP"
         else
-          warn "Keine IP via ARP gefunden (VM hat evtl. noch keine DHCP-Lease oder kein Netz). Konsole nutzen: Proxmox-WebUI -> VM $VMID -> Konsole. Dort:Strg+Alt+F2 -> Shell -> 'ifconfig eth0'."
+          warn "Keine IP via ARP gefunden (VM hat evtl. noch keine DHCP-Lease oder kein Netz). Konsole nutzen: Proxmox-WebUI -> VM $VMID -> Konsole. Dort: Strg+Alt+F2 -> Shell -> 'ifconfig eth0'."
         fi
       fi
     else
@@ -596,7 +631,7 @@ fi
 # Aufräumen nur bei Erfolg (bei Fehler Dateien für Re-Analyse liegen lassen)
 if [ "$DRY_RUN" = "0" ] && [ -n "${RAW_FILE:-}" ] && [ -f "$RAW_FILE" ]; then
   log "Räume $TMPDIR_WORK auf (Image-Cache wird gelöscht, VM-Disk bleibt auf $STORAGE) ..."
-  rm -f "$RAW_FILE" ${XZ_FILE:+$XZ_FILE} 2>/dev/null || true
+  rm -f "$RAW_FILE" ${XZ_FILE:+$XZ_FILE} ${ZIP_FILE:+$ZIP_FILE} 2>/dev/null || true
 fi
 
 echo ""
