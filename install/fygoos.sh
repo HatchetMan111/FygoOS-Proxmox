@@ -150,6 +150,21 @@ command -v pvesh >/dev/null || { echo "[XX] 'pvesh' nicht gefunden – kein Prox
 command -v pvesm >/dev/null || { echo "[XX] 'pvesm' nicht gefunden." >&2; exit 1; }
 command -v curl >/dev/null || command -v wget >/dev/null || { echo "[XX] curl oder wget erforderlich." >&2; exit 1; }
 command -v xz >/dev/null || { echo "[XX] 'xz' erforderlich (apt install xz-utils)." >&2; exit 1; }
+# GRUB-/Serial-Tweak brauchen kpartx (multipath-tools) – früh sicherstellen, damit nicht
+# erst nach dem Disk-Import der Tweak übersprungen wird und die VM im Grafik-Hänger landet.
+if [ "${GRUB_TWEAK:-1}" = "1" ] || [ "${SERIAL_CONSOLE:-0}" = "1" ]; then
+  if ! command -v kpartx >/dev/null; then
+    if [ "$DRY_RUN" = "1" ]; then
+      warn "Dry-Run: kpartx fehlt – ESP-Tweaks würden übersprungen (apt install multipath-tools)."
+    elif command -v apt-get >/dev/null && apt-get update -qq >>"$LOG" 2>&1 && apt-get install -y multipath-tools >>"$LOG" 2>&1; then
+      ok "kpartx (multipath-tools) fehlte und wurde nachinstalliert."
+    else
+      echo "[XX] 'kpartx' fehlt und konnte nicht automatisch installiert werden (apt install multipath-tools)." >&2
+      echo "[XX] Ohne kpartx können ESP/grub.cfg und syslinux nicht gepatcht werden – Abbruch vor der VM-Erstellung." >&2
+      exit 1
+    fi
+  fi
+fi
 
 # ---------- nächste freie VMID (Default; Kollision wird nach den Prompts geprüft) ----------
 ensure_vmid_free() {
@@ -519,10 +534,10 @@ else
   # ---------- GRUB-Tweak auf der ESP (best-effort, bricht Install bei Fehler NICHT ab) ----------
   # Befund: FydeOS-Kernel hängt mit i915.modeset=1 (keine Intel-GPU unter QEMU).
   # Die ESP wird per kpartx gemappt, grub.cfg gesichert + gepatcht, alles wieder aufgeräumt.
-  if [ "${GRUB_TWEAK:-1}" != "1" ]; then
-    log "GRUB-Tweak deaktiviert (--no-grub-tweak) – ESP bleibt unverändert."
+  if [ "${GRUB_TWEAK:-1}" != "1" ] && [ "${SERIAL_CONSOLE:-0}" != "1" ]; then
+    log "GRUB-Tweak deaktiviert und Serial-Console aus – ESP bleibt unverändert."
   elif ! command -v kpartx >/dev/null; then
-    warn "kpartx fehlt (apt install multipath-tools) – GRUB-Tweak übersprungen."
+    warn "kpartx fehlt (apt install multipath-tools) – ESP-Tweaks übersprungen."
   else
     DISK_DEV="$(pvesm path "$UNUSED" 2>/dev/null || true)"
     if [ -z "${DISK_DEV:-}" ] || [ ! -e "$DISK_DEV" ]; then
@@ -536,7 +551,9 @@ else
         mkdir -p "$MNT"
         if mount -o rw "$ESP_MAP" "$MNT" 2>>"$LOG"; then
           GRUBCFG="$(find "$MNT" -ipath '*efi/boot/grub.cfg' 2>/dev/null | head -n1 || true)"
-          if [ -n "${GRUBCFG:-}" ] && [ -f "$GRUBCFG" ]; then
+          if [ "${GRUB_TWEAK:-1}" != "1" ]; then
+            log "GRUB-Tweak deaktiviert (--no-grub-tweak) – nur Serial-Console-Patch auf der ESP."
+          elif [ -n "${GRUBCFG:-}" ] && [ -f "$GRUBCFG" ]; then
               cp "$GRUBCFG" "$GRUBCFG.orig"
               sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$GRUBCFG" || warn "sed grub.cfg fehlgeschlagen."
               NTWEAK="$(grep -c nomodeset "$GRUBCFG" || true)"
@@ -544,16 +561,18 @@ else
             else
               warn "efi/boot/grub.cfg nicht auf ESP – GRUB-Teil übersprungen."
             fi
-            # SeaBIOS-Pfad bootet via MBR->syslinux (NICHT grub.cfg) -> dort ebenfalls nomodeset
-            NSYS=0
-            for cfg in "$MNT"/syslinux/*.cfg "$MNT"/syslinux.cfg; do
-              [ -f "$cfg" ] || continue
-              if grep -q "i915.modeset=1" "$cfg" 2>/dev/null; then
-                cp "$cfg" "$cfg.orig" 2>>"$LOG" || true
-                if sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$cfg" 2>>"$LOG"; then NSYS=$((NSYS+1)); fi
-              fi
-            done
-            ok "syslinux-Tweak: $NSYS cfg-Datei(en) mit nomodeset gepatcht (SeaBIOS-Boot)."
+            if [ "${GRUB_TWEAK:-1}" = "1" ]; then
+              # SeaBIOS-Pfad bootet via MBR->syslinux (NICHT grub.cfg) -> dort ebenfalls nomodeset
+              NSYS=0
+              for cfg in "$MNT"/syslinux/*.cfg "$MNT"/syslinux.cfg; do
+                [ -f "$cfg" ] || continue
+                if grep -q "i915.modeset=1" "$cfg" 2>/dev/null; then
+                  cp "$cfg" "$cfg.orig" 2>>"$LOG" || true
+                  if sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$cfg" 2>>"$LOG"; then NSYS=$((NSYS+1)); fi
+                fi
+              done
+              ok "syslinux-Tweak: $NSYS cfg-Datei(en) mit nomodeset gepatcht (SeaBIOS-Boot)."
+            fi
             if [ "${SERIAL_CONSOLE:-0}" = "1" ]; then
               NSER=0
               for cfg in "$MNT"/syslinux/*.cfg "$MNT"/syslinux.cfg; do
@@ -564,6 +583,15 @@ else
                 fi
               done
               ok "Serial-Tweak: $NSER cfg-Datei(en) mit console=ttyS0 (Kernel-Log per 'qm terminal $VMID' lesbar)."
+              # OVMF/GRUB-Pfad: der Kernel läuft über grub.cfg (nicht syslinux) – dort ebenfalls
+              # console=ttyS0 ergänzen, sonst bleibt 'qm terminal' auf dem Default-Pfad stumm.
+              if [ -n "${GRUBCFG:-}" ] && [ -f "$GRUBCFG" ] && ! grep -q "console=ttyS0" "$GRUBCFG" 2>/dev/null; then
+                if sed -i '/root=/s/$/ console=ttyS0,115200n8/' "$GRUBCFG" 2>>"$LOG"; then
+                  ok "grub.cfg: console=ttyS0 ergänzt (Kernel-Log per 'qm terminal $VMID' auch auf OVMF-Pfad)."
+                else
+                  warn "grub.cfg Serial-Patch fehlgeschlagen – Kernel-Log nur im noVNC sichtbar."
+                fi
+              fi
             fi
           umount "$MNT" 2>>"$LOG" || warn "umount $MNT fehlgeschlagen – bitte manuell: umount $MNT"
         else
