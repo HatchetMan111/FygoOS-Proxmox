@@ -28,6 +28,19 @@ function Cmd({ children }: { children: string }) {
 export function Troubleshooting() {
   return (
     <div className="trouble-list">
+      <Item summary="VM hängt beim Boot – reparieren statt neu installieren">
+        <p>
+          Der Doctor prüft die bestehende VM (RAM, efidisk-Keys, serial0, ob <code>nomodeset</code> und die
+          Console wirklich in der <code>grub.cfg</code> stehen) und liest das Kernel-Log von der seriellen
+          Konsole. Mit <code>--fix</code> repariert er automatisch, startet die VM neu und testet den Boot selbst:
+        </p>
+        <Cmd>{`bash -c "$(wget -qLO - https://raw.githubusercontent.com/HatchetMan111/FygoOS-Proxmox/main/install/fygoos.sh)" fygoos.sh --doctor --vmid 109 --fix`}</Cmd>
+        <p>
+          VMID anpassen. Bei <code>Waiting for root device</code>, Kernel-Panic oder stummer Konsole druckt der
+          Doctor die passenden nächsten Befehle fertig zum Kopieren aus — inklusive echter Disk-ID.
+        </p>
+      </Item>
+
       <Item summary="Schwarzer Bildschirm / Boot hängt beim Grafik-Init">
         <p>
           FydeOS supportet offiziell nur VMware; unter KVM bleibt der Boot teils beim Grafik-Init stehen

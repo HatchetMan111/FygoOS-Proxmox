@@ -215,7 +215,7 @@ serial_verdict() { # $1=VMID  $2=Volid der Bootdisk  $3=Boot-Device (sata0|virti
 }
 
 doctor() {
-  local vmid="${VMID:-}" conf mem bootdev volid path esp_map mnt grubcfg running
+  local vmid="${VMID:-}" conf mem bootdev volid path esp_map mnt grubcfg running fixes=0
   if [ -z "$vmid" ]; then
     vmid="$(qm list 2>/dev/null | awk -v n="$NAME" '$2==n {print $1; exit}' || true)"
     [ -n "$vmid" ] && log "VM mit Name '$NAME' gefunden: $vmid"
@@ -231,7 +231,7 @@ doctor() {
   else
     warn "memory=${mem:-?} MB < 8192 (Forum: darunter Reboot-Loops/Hänger)."
     if [ "$FIX" = "1" ]; then
-      if qm set "$vmid" --memory 8192 >/dev/null 2>&1; then ok "FIX: memory=8192 gesetzt."; else warn "FIX memory fehlgeschlagen."; fi
+      if qm set "$vmid" --memory 8192 >/dev/null 2>&1; then ok "FIX: memory=8192 gesetzt."; fixes=$((fixes+1)); else warn "FIX memory fehlgeschlagen."; fi
     fi
   fi
   if printf '%s\n' "$conf" | grep -q '^efidisk0:'; then
@@ -251,7 +251,7 @@ doctor() {
   else
     warn "serial0 fehlt – 'qm terminal' ohne Funktion."
     if [ "$FIX" = "1" ]; then
-      if qm set "$vmid" --serial0 socket >/dev/null 2>&1; then ok "FIX: serial0=socket gesetzt."; else warn "FIX serial0 fehlgeschlagen."; fi
+      if qm set "$vmid" --serial0 socket >/dev/null 2>&1; then ok "FIX: serial0=socket gesetzt."; fixes=$((fixes+1)); else warn "FIX serial0 fehlgeschlagen."; fi
     fi
   fi
   bootdev="$(printf '%s\n' "$conf" | awk -F: '/^(sata0|virtio0|scsi0):/ {print $1; exit}')"
@@ -274,7 +274,7 @@ doctor() {
                 if [ "$FIX" = "1" ]; then
                   cp "$grubcfg" "$grubcfg.orig" 2>>"$LOG" || true
                   if sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$grubcfg" 2>>"$LOG"; then
-                    ok "FIX: nomodeset nachgetragen (Backup grub.cfg.orig)."
+                    ok "FIX: nomodeset nachgetragen (Backup grub.cfg.orig)."; fixes=$((fixes+1))
                   else
                     warn "FIX nomodeset fehlgeschlagen."
                   fi
@@ -287,7 +287,7 @@ doctor() {
                   warn "grub.cfg: nur console=ttyS0 -> noVNC bleibt SCHWARZ (wirkt wie Hänger, ist aber nur Ausgabe-Umleitung)."
                   if [ "$FIX" = "1" ]; then
                     if sed -i 's/console=ttyS0/console=tty0 console=ttyS0/' "$grubcfg" 2>>"$LOG"; then
-                      ok "FIX: console=tty0 ergänzt – Kernel-Log jetzt auch im noVNC sichtbar."
+                      ok "FIX: console=tty0 ergänzt – Kernel-Log jetzt auch im noVNC sichtbar."; fixes=$((fixes+1))
                     else
                       warn "FIX console=tty0 fehlgeschlagen."
                     fi
@@ -297,7 +297,7 @@ doctor() {
                 warn "grub.cfg: kein console=ttyS0 – Kernel-Log nur im noVNC sichtbar."
                 if [ "$FIX" = "1" ]; then
                   if sed -i '/root=/s/$/ console=tty0 console=ttyS0,115200n8/' "$grubcfg" 2>>"$LOG"; then
-                    ok "FIX: console=tty0+ttyS0 ergänzt (Log im noVNC UND per qm terminal)."
+                    ok "FIX: console=tty0+ttyS0 ergänzt (Log im noVNC UND per qm terminal)."; fixes=$((fixes+1))
                   else
                     warn "FIX console fehlgeschlagen."
                   fi
@@ -323,6 +323,15 @@ doctor() {
     fi
   else
     warn "Keine Bootdisk (sata0/virtio0/scsi0) in der Config gefunden."
+  fi
+  # Gepatchte ESP/Config greift erst nach Neustart – laufende VM einmal durchstarten
+  if [ "$FIX" = "1" ] && [ "${fixes:-0}" -ge 1 ]; then
+    if [ "$(qm status "$vmid" 2>/dev/null | awk '/status:/ {print $2}')" = "running" ]; then
+      log "Fixes angewendet ($fixes) – Neustart der VM, damit die neue Kernel-Config greift ..."
+      qm stop "$vmid" >/dev/null 2>&1 || true
+      qm wait "$vmid" --timeout 30 >/dev/null 2>&1 || true
+      if qm start "$vmid" >/dev/null 2>&1; then sleep 8; fi
+    fi
   fi
   running="$(qm status "$vmid" 2>/dev/null | awk '/status:/ {print $2}')"
   if [ "$running" = "running" ]; then
