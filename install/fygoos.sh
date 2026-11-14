@@ -19,6 +19,7 @@
 #   bash fygoos.sh --serial-console # Kernel-Log auf seriell (Debug per "qm terminal VMID")
 #   bash fygoos.sh --headless       # Server-Modus: VGA=none + serielle Konsole (Zugriff qm terminal/SSH)
 #   bash fygoos.sh --no-grub-tweak  # ESP/grub.cfg unverändert lassen (Default: nomodeset-Tweak aktiv)
+#   bash fygoos.sh --doctor --vmid 109 --fix   # bestehende VM prüfen + automatisch reparieren (keine Neuinstallation)
 #
 # Warum VM statt LXC: FygoOS ist ein vollständiges ChromeOS-artiges Desktop-OS
 # (eigener Kernel, Android-/Linux-Container). Das läuft nicht in einem LXC.
@@ -65,6 +66,8 @@ HEADLESS="${HEADLESS:-0}"              # 1 = Server-Modus ohne Desktop: VGA=none
 START="${START:-1}"                    # 1 = VM nach Erstellung starten, 0 = nur anlegen
 DRY_RUN="${DRY_RUN:-0}"                # 1 = nur Befehle zeigen
 YES="${YES:-0}"                        # 1 = keine Rückfragen (unattended). Default: bei TTY interaktiv abfragen
+DOCTOR="${DOCTOR:-0}"                  # 1 = nur Diagnose einer bestehenden VM (mit --vmid), keine Neuinstallation
+FIX="${FIX:-0}"                        # 1 = in Verbindung mit --doctor: gefundene Probleme automatisch beheben
 LOG="/tmp/fygoos-install-$(date +%Y%m%d-%H%M%S).log"
 TMPDIR_WORK="/var/tmp/fygoos-install"
 
@@ -106,6 +109,9 @@ Steuerung:
   --serial-console     Kernel-Log auf seriell (lesen per "qm terminal VMID")
   --headless           Server-Modus: VGA=none + serielle Konsole
   --no-grub-tweak      ESP/grub.cfg unverändert lassen (Default: nomodeset aktiv)
+  --doctor             bestehende VM nur diagnostizieren (braucht --vmid; prüft RAM/efidisk/
+                       serial0/ESP-Patches, liest Kernel-Log seriell, gibt Fix-Befehle aus)
+  --fix                nur mit --doctor: gefundene Probleme automatisch beheben
   -h|--help            diese Hilfe
 
 Ohne --yes fragt das Script bei TTY zu Beginn ab (VMID, Name, Kerne, RAM, Disk,
@@ -135,6 +141,8 @@ while [ $# -gt 0 ]; do
     --headless) HEADLESS="1"; shift;;
     --no-start|--manual) START="0"; shift;;   # nur VM hinstellen, Start + Konsole manuell (wie PBS --manual)
     --dry-run) DRY_RUN="1"; shift;;
+    --doctor) DOCTOR="1"; shift;;
+    --fix) FIX="1"; shift;;
     --yes|-y) YES="1"; shift;;
     --debug) DEBUG="1"; set -x; shift;;
     -h|--help) usage; exit 0;;
@@ -159,10 +167,205 @@ if [ "${GRUB_TWEAK:-1}" = "1" ] || [ "${SERIAL_CONSOLE:-0}" = "1" ]; then
     elif command -v apt-get >/dev/null && apt-get update -qq >>"$LOG" 2>&1 && apt-get install -y multipath-tools >>"$LOG" 2>&1; then
       ok "kpartx (multipath-tools) fehlte und wurde nachinstalliert."
     else
-      echo "[XX] 'kpartx' fehlt und konnte nicht automatisch installiert werden (apt install multipath-tools)." >&2
-      echo "[XX] Ohne kpartx können ESP/grub.cfg und syslinux nicht gepatcht werden – Abbruch vor der VM-Erstellung." >&2
-      exit 1
+      if [ "${DOCTOR:-0}" = "1" ]; then
+        warn "kpartx fehlt (Installation fehlgeschlagen) – Doctor prüft nur die Config-Teile."
+      else
+        echo "[XX] 'kpartx' fehlt und konnte nicht automatisch installiert werden (apt install multipath-tools)." >&2
+        echo "[XX] Ohne kpartx können ESP/grub.cfg und syslinux nicht gepatcht werden – Abbruch vor der VM-Erstellung." >&2
+        exit 1
+      fi
     fi
+  fi
+fi
+
+# ---------- Diagnose: Kernel-Log seriell auswerten (Doctor + Boot-Watch) ----------
+serial_verdict() { # $1=VMID  $2=Volid der Bootdisk  $3=Boot-Device (sata0|virtio0|scsi0)
+  local vmid="$1" volid="${2:-<volid>}" bootdev="${3:-sata0}"
+  echo ""
+  echo "  ── Kernel-Log-Analyse (seriell) ──"
+  if [ -z "${BOOT_LOG:-}" ]; then
+    warn "Keine serielle Ausgabe im Zeitfenster – Kernel erreicht die Konsole nicht (früher Boot-Hänger)"
+    echo "     oder console=ttyS0 fehlt in grub.cfg (--doctor prüft das)."
+    echo "     Nächster Versuch – Bootdisk auf anderen Controller legen:"
+    echo "       qm shutdown $vmid && qm wait $vmid --timeout 30"
+    echo "       qm set $vmid --delete $bootdev"
+    echo "       qm set $vmid --virtio0 $volid && qm set $vmid --boot order=virtio0 && qm start $vmid"
+    echo "     (statt virtio0 alternativ scsi0 testen)"
+  elif printf '%s' "$BOOT_LOG" | grep -q 'Waiting for root device'; then
+    warn "Kernel hängt: 'Waiting for root device'."
+    if printf '%s' "$BOOT_LOG" | grep -qE '\[sd[a-z]\]'; then
+      echo "     Platte wurde als [sdX] erkannt, aber root=PARTUUID passt nicht -> Image/Partition verdächtig."
+      echo "     Forum-bewährter Ausweg: v18-.img.xz von https://fydeos.io/download/ laden, nach /var/tmp kopieren,"
+      echo "     neu installieren mit IMAGE_URL=file:///var/tmp/<datei>.img.xz VARIANT=iris"
+    else
+      echo "     KEINE [sdX]-Zeile im Log: der Kernel sieht die Platte nicht -> Controller wechseln:"
+      echo "       qm shutdown $vmid && qm wait $vmid --timeout 30"
+      echo "       qm set $vmid --delete $bootdev"
+      echo "       qm set $vmid --scsi0 $volid && qm set $vmid --boot order=scsi0 && qm start $vmid"
+    fi
+  elif printf '%s' "$BOOT_LOG" | grep -qiE 'Kernel panic|not syncing'; then
+    warn "Kernel panic – die letzten Zeilen nennen die Ursache:"
+    printf '%s\n' "$BOOT_LOG" | tail -15 | sed 's/^/     /'
+  elif printf '%s' "$BOOT_LOG" | grep -qiE 'Welcome to|login|fydeos|chrome|startup'; then
+    ok "Boot sieht lebendig aus – erster Boot dauert Minuten, im noVNC abwarten."
+  else
+    log "Muster nicht eindeutig – letzte 15 Zeilen (Voll-Log: $LOG):"
+    printf '%s\n' "$BOOT_LOG" | tail -15 | sed 's/^/     /'
+  fi
+}
+
+doctor() {
+  local vmid="${VMID:-}" conf mem bootdev volid path esp_map mnt grubcfg running
+  if [ -z "$vmid" ]; then
+    vmid="$(qm list 2>/dev/null | awk -v n="$NAME" '$2==n {print $1; exit}' || true)"
+    [ -n "$vmid" ] && log "VM mit Name '$NAME' gefunden: $vmid"
+  fi
+  [ -n "$vmid" ] || { echo "[XX] --doctor: bitte --vmid <ID> angeben (oder per --name <name> suchen lassen)." >&2; exit 1; }
+  qm status "$vmid" >/dev/null 2>&1 || { echo "[XX] VM $vmid existiert nicht (qm list)." >&2; exit 1; }
+  conf="$(qm config "$vmid")"
+  echo ""
+  echo "════════════ FygoOS Doctor – VM $vmid ════════════"
+  mem="$(printf '%s\n' "$conf" | awk '/^memory:/ {print $2}')"
+  if [ "${mem:-0}" -ge 8192 ] 2>/dev/null; then
+    ok "memory=${mem} MB (>=8192)."
+  else
+    warn "memory=${mem:-?} MB < 8192 (Forum: darunter Reboot-Loops/Hänger)."
+    if [ "$FIX" = "1" ]; then
+      if qm set "$vmid" --memory 8192 >/dev/null 2>&1; then ok "FIX: memory=8192 gesetzt."; else warn "FIX memory fehlgeschlagen."; fi
+    fi
+  fi
+  if printf '%s\n' "$conf" | grep -q '^efidisk0:'; then
+    if printf '%s\n' "$conf" | grep '^efidisk0:' | grep -q 'pre-enrolled-keys=0'; then
+      ok "efidisk0 ohne Secure-Boot-Keys (pre-enrolled-keys=0)."
+    else
+      warn "efidisk0 MIT Secure-Boot-Keys – OVMF kann den unsignierten FydeOS-GRUB ablehnen ('No bootable device')."
+      echo "     Fix (Storage aus der efidisk0-Zeile übernehmen):"
+      echo "       qm stop $vmid && qm set $vmid --delete efidisk0"
+      echo "       qm set $vmid --efidisk0 <storage>:1,pre-enrolled-keys=0 && qm start $vmid"
+    fi
+  else
+    warn "kein efidisk0 (BIOS=seabios?) – OVMF-Pfad nicht aktiv."
+  fi
+  if printf '%s\n' "$conf" | grep -q '^serial0:'; then
+    ok "serial0 vorhanden (Kernel-Log per 'qm terminal $vmid')."
+  else
+    warn "serial0 fehlt – 'qm terminal' ohne Funktion."
+    if [ "$FIX" = "1" ]; then
+      if qm set "$vmid" --serial0 socket >/dev/null 2>&1; then ok "FIX: serial0=socket gesetzt."; else warn "FIX serial0 fehlgeschlagen."; fi
+    fi
+  fi
+  bootdev="$(printf '%s\n' "$conf" | awk -F: '/^(sata0|virtio0|scsi0):/ {print $1; exit}')"
+  volid="$(printf '%s\n' "$conf" | sed -n 's/^\(sata0\|virtio0\|scsi0\): *//p' | head -n1 | cut -d, -f1)"
+  if [ -n "$volid" ]; then
+    path="$(pvesm path "$volid" 2>/dev/null || true)"
+    if [ -n "$path" ] && [ -e "$path" ] && command -v kpartx >/dev/null; then
+      if kpartx -av "$path" >>"$LOG" 2>&1; then
+        sleep 1
+        esp_map="$(blkid 2>/dev/null | grep -i 'PARTLABEL="EFI-SYSTEM"' | cut -d: -f1 | head -n1 || true)"
+        if [ -n "$esp_map" ]; then
+          mnt="$TMPDIR_WORK/doctor-esp"; mkdir -p "$mnt"
+          if mount -o rw "$esp_map" "$mnt" 2>>"$LOG"; then
+            grubcfg="$(find "$mnt" -ipath '*efi/boot/grub.cfg' 2>/dev/null | head -n1 || true)"
+            if [ -n "$grubcfg" ] && [ -f "$grubcfg" ]; then
+              if grep -q nomodeset "$grubcfg" 2>/dev/null; then
+                ok "grub.cfg: nomodeset aktiv."
+              else
+                warn "grub.cfg: nomodeset FEHLT – das ist der bekannte Grafik-Init-Hänger unter QEMU!"
+                if [ "$FIX" = "1" ]; then
+                  cp "$grubcfg" "$grubcfg.orig" 2>>"$LOG" || true
+                  if sed -i 's/i915\.modeset=1/i915.modeset=0 nomodeset/' "$grubcfg" 2>>"$LOG"; then
+                    ok "FIX: nomodeset nachgetragen (Backup grub.cfg.orig)."
+                  else
+                    warn "FIX nomodeset fehlgeschlagen."
+                  fi
+                fi
+              fi
+              if grep -q 'console=ttyS0' "$grubcfg" 2>/dev/null; then
+                if grep -q 'console=tty0' "$grubcfg" 2>/dev/null; then
+                  ok "grub.cfg: Kernel-Log auf noVNC UND seriell (tty0+ttyS0)."
+                else
+                  warn "grub.cfg: nur console=ttyS0 -> noVNC bleibt SCHWARZ (wirkt wie Hänger, ist aber nur Ausgabe-Umleitung)."
+                  if [ "$FIX" = "1" ]; then
+                    if sed -i 's/console=ttyS0/console=tty0 console=ttyS0/' "$grubcfg" 2>>"$LOG"; then
+                      ok "FIX: console=tty0 ergänzt – Kernel-Log jetzt auch im noVNC sichtbar."
+                    else
+                      warn "FIX console=tty0 fehlgeschlagen."
+                    fi
+                  fi
+                fi
+              else
+                warn "grub.cfg: kein console=ttyS0 – Kernel-Log nur im noVNC sichtbar."
+                if [ "$FIX" = "1" ]; then
+                  if sed -i '/root=/s/$/ console=tty0 console=ttyS0,115200n8/' "$grubcfg" 2>>"$LOG"; then
+                    ok "FIX: console=tty0+ttyS0 ergänzt (Log im noVNC UND per qm terminal)."
+                  else
+                    warn "FIX console fehlgeschlagen."
+                  fi
+                fi
+              fi
+            else
+              warn "efi/boot/grub.cfg auf der ESP nicht gefunden – Layout manuell prüfen:"
+              echo "       kpartx -av $path && blkid | grep -i efi"
+            fi
+            umount "$mnt" 2>>"$LOG" || true
+          else
+            warn "ESP-Mount fehlgeschlagen ($esp_map)."
+          fi
+        else
+          warn "EFI-SYSTEM-Partition nicht gefunden (blkid) – Image-Layout ungewöhnlich."
+        fi
+        kpartx -d "$path" >>"$LOG" 2>&1 || true
+      else
+        warn "kpartx-Mapping fehlgeschlagen ($path)."
+      fi
+    else
+      warn "Bootdisk nicht prüfbar (Pfad nicht auflösbar oder kpartx fehlt): $volid"
+    fi
+  else
+    warn "Keine Bootdisk (sata0/virtio0/scsi0) in der Config gefunden."
+  fi
+  running="$(qm status "$vmid" 2>/dev/null | awk '/status:/ {print $2}')"
+  if [ "$running" = "running" ]; then
+    if command -v socat >/dev/null; then
+      log "VM läuft – capture 45s Kernel-Log von der seriellen Konsole ..."
+      BOOT_LOG="$(timeout 45 socat - UNIX-CONNECT:/var/run/qemu-server/${vmid}.serial 2>/dev/null || true)"
+      printf '%s\n' "${BOOT_LOG:-}" >>"$LOG" 2>/dev/null || true
+      serial_verdict "$vmid" "$volid" "${bootdev:-sata0}"
+    else
+      warn "socat fehlt (apt install socat) – Kernel-Log manuell: qm terminal $vmid"
+    fi
+  else
+    echo ""
+    log "VM steht – Boot-Test: qm start $vmid  (oder Doctor mit --fix startet selbst)"
+    if [ "$FIX" = "1" ]; then
+      if qm start "$vmid" >/dev/null 2>&1; then
+        sleep 8
+        if command -v socat >/dev/null; then
+          log "Capture 45s Kernel-Log nach Start ..."
+          BOOT_LOG="$(timeout 45 socat - UNIX-CONNECT:/var/run/qemu-server/${vmid}.serial 2>/dev/null || true)"
+          printf '%s\n' "${BOOT_LOG:-}" >>"$LOG" 2>/dev/null || true
+          serial_verdict "$vmid" "$volid" "${bootdev:-sata0}"
+        fi
+      else
+        warn "qm start fehlgeschlagen."
+      fi
+    fi
+  fi
+  echo "══════════════════════════════════════════════════"
+}
+
+if [ "${DOCTOR:-0}" = "1" ]; then
+  command -v kpartx >/dev/null 2>&1 || apt-get install -y multipath-tools >>"$LOG" 2>&1 || true
+  command -v socat >/dev/null 2>&1 || apt-get install -y socat >>"$LOG" 2>&1 || true
+  doctor
+  exit 0
+fi
+# socat für Boot-Watch (nur Annehmlichkeit, kein Pflicht-Dependency)
+if [ "${SERIAL_CONSOLE:-0}" = "1" ] && [ "$DRY_RUN" != "1" ] && ! command -v socat >/dev/null; then
+  if command -v apt-get >/dev/null && apt-get install -y socat >>"$LOG" 2>&1; then
+    ok "socat nachinstalliert (für den Boot-Watch nach dem Start)."
+  else
+    warn "socat fehlt – Boot-Watch wird übersprungen (apt install socat)."
   fi
 fi
 
@@ -579,15 +782,17 @@ else
                 [ -f "$cfg" ] || continue
                 if grep -qE '^[[:space:]]*append ' "$cfg" 2>/dev/null && ! grep -q "console=ttyS0" "$cfg" 2>/dev/null; then
                   cp "$cfg" "$cfg.orig" 2>>"$LOG" || true
-                  if sed -i 's/^\([[:space:]]*append .*\)/\1 console=ttyS0,115200n8/' "$cfg" 2>>"$LOG"; then NSER=$((NSER+1)); fi
+                  if sed -i 's/^\([[:space:]]*append .*\)/\1 console=tty0 console=ttyS0,115200n8/' "$cfg" 2>>"$LOG"; then NSER=$((NSER+1)); fi
                 fi
               done
               ok "Serial-Tweak: $NSER cfg-Datei(en) mit console=ttyS0 (Kernel-Log per 'qm terminal $VMID' lesbar)."
               # OVMF/GRUB-Pfad: der Kernel läuft über grub.cfg (nicht syslinux) – dort ebenfalls
-              # console=ttyS0 ergänzen, sonst bleibt 'qm terminal' auf dem Default-Pfad stumm.
+              # console ergänzen, sonst bleibt 'qm terminal' auf dem Default-Pfad stumm.
+              # Bewusst DOPPELT: tty0 (noVNC) + ttyS0 (qm terminal) – nur ttyS0 allein
+              # würde noVNC schwarz lassen und wirkt wie ein Hänger.
               if [ -n "${GRUBCFG:-}" ] && [ -f "$GRUBCFG" ] && ! grep -q "console=ttyS0" "$GRUBCFG" 2>/dev/null; then
-                if sed -i '/root=/s/$/ console=ttyS0,115200n8/' "$GRUBCFG" 2>>"$LOG"; then
-                  ok "grub.cfg: console=ttyS0 ergänzt (Kernel-Log per 'qm terminal $VMID' auch auf OVMF-Pfad)."
+                if sed -i '/root=/s/$/ console=tty0 console=ttyS0,115200n8/' "$GRUBCFG" 2>>"$LOG"; then
+                  ok "grub.cfg: console=tty0+ttyS0 ergänzt (Kernel-Log im noVNC UND per 'qm terminal $VMID')."
                 else
                   warn "grub.cfg Serial-Patch fehlgeschlagen – Kernel-Log nur im noVNC sichtbar."
                 fi
@@ -653,6 +858,13 @@ if [ "$START" = "1" ]; then
     else
       warn "VM läuft (noch) nicht – Ausgabe oben + Log prüfen: $LOG"
     fi
+    # Boot-Watch: Kernel-Log seriell mitlesen und automatisch auswerten
+    if [ "${SERIAL_CONSOLE:-0}" = "1" ] && command -v socat >/dev/null; then
+      log "Boot-Watch: lese 60s Kernel-Log von der seriellen Konsole (noVNC zeigt parallel weiter) ..."
+      BOOT_LOG="$(timeout 60 socat - UNIX-CONNECT:/var/run/qemu-server/${VMID}.serial 2>/dev/null || true)"
+      printf '%s\n' "${BOOT_LOG:-}" >>"$LOG" 2>/dev/null || true
+      serial_verdict "$VMID" "${UNUSED:-}" "${BOOT_DEV:-sata0}"
+    fi
   fi
 fi
 
@@ -680,13 +892,16 @@ echo "  Kernel-Log: qm terminal $VMID  (oder: timeout 60 socat - UNIX-CONNECT:/v
 fi
 echo "  Log      : $LOG"
 echo ""
-echo "  Falls schwarzer Bildschirm / Boot hängt / keine IP (bekannt, siehe Forum):"
-echo "    1) Falsche Variante? Script erkennt per lscpu (AMD->apu, Celeron/Pentium->slim, Intel->iris)."
-echo "       Erzwingen: VARIANT=apu|iris|slim bash fygoos.sh (Core 3.-5. Gen: --variant legacy + IMAGE_URL von fydeos.io/download/)"
-echo "    2) Konsole prüfen (noVNC): Bootlogo/Desktop = ok, nur warten (erster Boot lang)."
-echo "    3) Bei Hänger: qm shutdown $VMID && qm wait $VMID && qm start $VMID (RAM ist schon 8192)."
-echo "    4) Kein Netz trotz Desktop: qm set $VMID --delete net0 && qm set $VMID --net0 e1000,bridge=$BRIDGE && qm start $VMID"
-echo "    5) Weiter schwarz: echte GPU per Passthrough (lspci | grep -i vga -> qm set $VMID --hostpci0 <PCI>,pcie=1) + qm set $VMID --vga none"
-echo "       (im Forum: RX550 erfolgreich, integriertes QEMU-VGA bleibt schwarz)"
+echo "  ── WAS NUN? (erster Boot) ──"
+echo "  1) Konsole öffnen: Proxmox-WebUI -> VM $VMID -> Konsole (noVNC). Erster Boot dauert Minuten – warten."
+echo "  2) Komplett-Diagnose der fertigen VM in EINEM Befehl (prüft RAM/efidisk/serial0/ESP, liest"
+echo "     das Kernel-Log und nennt den passenden Fix, falls was hakt):"
+echo "       bash fygoos.sh --doctor --vmid $VMID --fix"
+echo "  3) Kernel-Log live: qm terminal $VMID   (beenden: Strg+O)"
+echo "  4) 'Waiting for root device' im Log? Doctor gibt den Controller-Wechsel-Befehl fertig aus."
+echo "  5) Kein Netz trotz Desktop: qm set $VMID --delete net0 && qm set $VMID --net0 e1000,bridge=$BRIDGE && qm start $VMID"
+echo "  6) Falsche Variante? VARIANT=apu|iris|slim erzwingen und neu installieren (Core 3.-5. Gen: --variant legacy)."
+echo "  7) Weiter schwarz: echte GPU per Passthrough (lspci | grep -i vga -> qm set $VMID --hostpci0 <PCI>,pcie=1)"
+echo "     + qm set $VMID --vga none (im Forum: RX550 erfolgreich)"
 echo "  Deinstall: qm stop $VMID && qm destroy $VMID --purge"
 echo "═════════════════════════════════════════════════════"

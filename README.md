@@ -56,7 +56,7 @@ Das Skript (`set -euo pipefail`, `trap ERR` mit Befehl+Zeile+Exit-Code):
 3. erstellt die VM (`ostype l26`, `cpu host`, UEFI+efidisk, VirtIO-Net, `vga std`, Guest-Agent aus, `onboot: 1`),
 4. lädt das Image (`.img.xz` per `xz -d`, `.bin.zip` per `unzip`), importiert per `qm disk import`, hängt als `sata0` mit `boot order=sata0` ein, erweitert auf Zielgröße,
 5. **GRUB-/syslinux-Tweak** (Default an, `--no-grub-tweak` zum Abschalten): mappt die ESP per `kpartx`, sichert `grub.cfg` + `syslinux/*.cfg` (`*.orig`) und ersetzt `i915.modeset=1` durch `i915.modeset=0 nomodeset` (QEMU hat keine Intel-GPU; dm-verity bleibt unangetastet – der syslinux-Teil ist der SeaBIOS-Bootpfad) – best-effort, bricht die Installation bei Fehlern nicht ab. Fehlendes `kpartx` (multipath-tools) wird vor der VM-Erstellung automatisch nachinstalliert, damit der Tweak nie still übersprungen wird,
-6. verifiziert `qm config` (Bootdisk + onboot) und `qm status` (running), sucht bis 90 s per ARP die DHCP-IP und gibt alles aus.
+6. verifiziert `qm config` (Bootdisk + onboot) und `qm status` (running), sucht bis 90 s per ARP die DHCP-IP, liest mit **Boot-Watch** 60 s Kernel-Log seriell ein und wertet es aus (nur mit `SERIAL_CONSOLE=1`) – bekannte Fehlermuster bekommen die Fix-Befehle direkt ins Terminal gedruckt.
 
 ## Kernel hängt? Serial-Console-Debug
 
@@ -67,7 +67,16 @@ qm terminal <VMID>                # Kernel-Log live (Beenden: Ctrl+O)
 timeout 60 socat - UNIX-CONNECT:/var/run/qemu-server/<VMID>.serial
 ```
 
-Das hängt `console=ttyS0,115200n8` an alle syslinux-`append`-Zeilen **und** die Kernel-Zeilen in `grub.cfg` (idempotent: kein Doppel-Eintrag) und legt `serial0` an – das Kernel-Log kommt so per `qm terminal` auch auf dem OVMF-Standardpfad. Die letzten Kernel-Zeilen vor dem Stillstand nennen die echte Ursache (`Waiting for root device`, `Kernel panic`, Treiber-Fehler).
+Das hängt `console=tty0 console=ttyS0,115200n8` an alle syslinux-`append`-Zeilen **und** die Kernel-Zeilen in `grub.cfg` (idempotent: kein Doppel-Eintrag) und legt `serial0` an – das Kernel-Log erscheint dadurch **parallel im noVNC und per `qm terminal`** (nur ttyS0 allein würde noVNC schwarz lassen und wie ein Hänger wirken). Direkt nach dem Start liest ein **Boot-Watch** 60 s Kernel-Log und wertet es aus: bei `Waiting for root device`, Kernel-Panic oder stummer Konsole stehen die passenden Fix-Befehle sofort im Terminal.
+
+## Bestehende VM prüfen: --doctor
+
+```bash
+bash fygoos.sh --doctor --vmid 109          # nur prüfen, Fix-Befehle werden ausgegeben
+bash fygoos.sh --doctor --vmid 109 --fix    # prüfen + automatisch beheben (RAM, serial0, ESP-Patches)
+```
+
+Der Doctor prüft `memory` (Fix: 8192), `efidisk0`-Secure-Boot-Keys, `serial0`, ob `nomodeset` **wirklich** in der `grub.cfg` steht (Fix: nachtragen), ob die Console-Doppelbelegung (tty0+ttyS0) sitzt (Fix: ergänzen), liest 45 s Kernel-Log von der seriellen Konsole und sagt bei `Waiting for root device` / Panic / stummer Konsole exakt, welcher Befehl als Nächstes hilft – fertig zum Kopieren, mit echter VMID und Disk-ID. Kein Neuinstallations-Zwang mehr.
 
 ## Headless Server-Modus (ohne Desktop)
 
